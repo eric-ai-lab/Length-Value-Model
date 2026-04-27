@@ -1,0 +1,68 @@
+### model
+model_name_or_path: Qwen/Qwen3-1.7B-Base
+trust_remote_code: true
+
+
+### method
+stage: lenvm
+do_train: true
+finetuning_type: full
+deepspeed: ./LlamaFactory-LenVM/examples/deepspeed/ds_z3_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
+lenvm_huber_loss_delta: 1.0
+lenvm_gamma: 0.999 # GAE parameter length
+lenvm_lam: 1.0 # GAE parameter MC/TD
+lenvm_relative_loss: false
+lenvm_agg_method: token-mean
+# max_finite_length: 5000
+lenvm_pos_metrics: 0.0,0.3,0.6,0.9
+valuehead_dropout: 0.0
+
+
+### dataset
+dataset: 30b_a3b_math_95k_16_train,30b_a3b_instruction_100k_16_train
+dataset_dir: ./data_generation/LenVM-Data
+template: qwen3_nothink
+cutoff_len: 16000
+max_samples: 100000000000
+overwrite_cache: false
+tokenized_path: ./cache/tokenized/abs-bf16-30b-a3b-instruction-lr2e-5-g0.999-l1.0-gpu4-bs4-ga64-ep2-wu50-cut16000
+preprocessing_num_workers: 8
+dataloader_num_workers: 8
+
+### output
+output_dir: ./saves/qwen3-1.7b-base/full/abs-bf16-30b-a3b-instruction-lr2e-5-g0.999-l1.0-gpu4-bs4-ga64-ep2-wu50-cut16000
+logging_steps: 1
+save_steps: 100
+save_strategy: steps # epoch / steps
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+# save_safetensors: false # not supported in some versions
+report_to: 
+  - wandb # choices: [none, wandb, tensorboard, swanlab, mlflow]
+run_name: lenvm/qwen3-1.7b-base/abs-bf16-30b-a3b-instruction-lr2e-5-g0.999-l1.0-gpu4-bs4-ga64-ep2-wu50-cut16000
+
+### train
+seed: 0
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 64
+learning_rate: 2.0e-5
+num_train_epochs: 2.0
+# max_steps: 5000
+lr_scheduler_type: cosine
+# lr_scheduler_type: constant
+# warmup_ratio: 0.1
+warmup_steps: 50
+# warmup_steps: 0
+bf16: true
+fp16: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+
+### eval
+eval_dataset: 30b_a3b_math_8k_1_test,30b_a3b_instruction_8k_1_test
+# val_size: 0.01
+per_device_eval_batch_size: 4
+eval_strategy: steps
+eval_steps: 50

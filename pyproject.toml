@@ -1,0 +1,69 @@
+[project]
+name = "lenvm-workspace"
+version = "0.1.0"
+description = "LenVM workspace shared environment definitions"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[dependency-groups]
+infer = [
+  "jsonlines",
+  "tqdm",
+  "datasets<4",
+  "openai",
+  "matplotlib",
+  "sglang",
+  "flash-attn==2.8.3"
+]
+train = [
+  "torch==2.9.1",
+  "torchvision",
+  "trl",
+  "deepspeed>=0.10.0,<=0.18.4",
+  "wandb",
+  "peft",
+  "huggingface-hub",
+  "tensorboard",
+  "tensorboardX",
+  "nltk",
+  "jieba",
+  "rouge-chinese",
+  "llamafactory",
+]
+eval = [
+  "anthropic",
+  "openai",
+  "protobuf",
+  "torch==2.9.1",
+  "datasets<4",
+  "transformers",
+  "google-genai",
+  "numpy",
+  "accelerate",
+  "tiktoken",
+  "peft",
+  "pandas",
+  "math-verify",
+  "latex2sympy2-extended",
+  "matplotlib",
+  "wordcloud"
+]
+
+[tool.uv.workspace]
+members = ["sglang-LenVM/python"]
+
+[tool.uv]
+default-groups = []
+no-build-isolation-package = ["flash-attn"]
+extra-build-dependencies = { sglang = ["setuptools", "setuptools-scm", "wheel", "grpcio-tools"] }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128"}]
+torchvision = [{ index = "pytorch-cu128"}]
+llamafactory = { path = "./LlamaFactory-LenVM", editable = true }
+sglang = { workspace = true }

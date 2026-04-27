@@ -1,0 +1,72 @@
+### model
+model_name_or_path: Qwen/Qwen2.5-VL-3B-Instruct
+image_max_pixels: 262144
+video_max_pixels: 16384
+trust_remote_code: true
+
+### method
+stage: lenvm
+do_train: true
+finetuning_type: full
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+freeze_language_model: false
+deepspeed: ./LlamaFactory-LenVM/examples/deepspeed/ds_z3_config.json  # choices: [ds_z0_config.json, ds_z2_config.json, ds_z3_config.json]
+lenvm_huber_loss_delta: 1.0
+lenvm_gamma: 0.997 # GAE parameter length
+lenvm_lam: 1.0 # GAE parameter MC/TD
+lenvm_relative_loss: false
+lenvm_agg_method: token-mean
+# max_finite_length: 5000
+lenvm_pos_metrics: 0.0,0.3,0.6,0.9
+valuehead_dropout: 0.0
+
+
+### dataset
+dataset: vl_7b_multimodal_reasoning_147k_16_train
+dataset_dir: ./data_generation/LenVM-Data
+template: qwen2_vl
+cutoff_len: 4000
+max_samples: 1000000000000
+overwrite_cache: false
+tokenized_path: ./cache/tokenized/vl_all_lenvm_qwen2.5_vl_3b_instruct_cut4000
+preprocessing_num_workers: 32
+dataloader_num_workers: 32
+
+### output
+output_dir: ./saves/qwen2.5-vl-3b-instruct/full/abs-bf16-vl-7b-multimodal-reasoning-147k-16-train-lr2e-5-g0.997-l1.0-gpu4-bs8-ga32-ep2-wu50-cut4000
+logging_steps: 1
+save_steps: 100
+save_strategy: steps # epoch / steps
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+# save_safetensors: false # not supported in some versions
+report_to: 
+  - wandb # choices: [none, wandb, tensorboard, swanlab, mlflow]
+run_name: qwen2.5-vl-3b-instruct/abs-bf16-vl-7b-multimodal-reasoning-147k-16-train-lr2e-5-g0.997-l1.0-gpu8-bs8-ga16-ep2-wu50-cut4000
+
+### train
+seed: 0
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 16
+learning_rate: 2.0e-5
+num_train_epochs: 2.0
+# max_steps: 5000
+lr_scheduler_type: cosine
+# lr_scheduler_type: constant
+# warmup_ratio: 0.1
+warmup_steps: 50
+# warmup_steps: 0
+bf16: true
+fp16: false
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+
+### eval
+eval_dataset: vl_7b_multimodal_reasoning_8k_1_test
+# val_size: 0.01
+per_device_eval_batch_size: 8
+eval_strategy: steps
+eval_steps: 50

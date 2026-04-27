@@ -1,0 +1,408 @@
+gpt-4o-mini:
+  model: "gpt-4o-mini-2024-07-18"
+  max_completion_tokens: 16384
+  temperature: 0.8
+  top_p: 1
+
+gpt-4o:
+  model: "gpt-4o-2024-11-20"
+  max_completion_tokens: 16384
+  temperature: 0.8
+  top_p: 1
+
+gpt-4.1-mini:
+  model: "gpt-4.1-mini"
+  max_completion_tokens: 32768
+  temperature: 0.8
+  top_p: 1
+
+gpt-4.1:
+  model: "gpt-4.1"
+  max_completion_tokens: 32768
+  temperature: 0.8
+  top_p: 1
+
+gpt-5.4:
+  model: "gpt-5.4"
+  max_completion_tokens: 65536
+
+gpt-5.4-thinking:
+  model: "gpt-5.4"
+  max_completion_tokens: 65536
+  reasoning_effort: "medium"
+
+o1-mini:
+  model: "o1-mini-2024-09-12"
+  max_completion_tokens: 65536
+
+o4-mini:
+  model: "o4-mini"
+  max_completion_tokens: 65536
+  reasoning_effort: "medium"
+
+o3-mini:
+  model: "o3-mini-2025-01-31"
+  max_completion_tokens: 65536
+  reasoning_effort: "medium"
+
+claude-3.5-sonnet:
+  model: "claude-3-5-sonnet-20241022"
+  count_model: "claude-3-5-sonnet-20241022"
+  max_tokens: 64000
+
+claude-3.7-sonnet:
+  model: "claude-3-7-sonnet-20250219"
+  count_model: "claude-3-7-sonnet-20250219"
+  max_tokens: 64000
+
+claude-3.7-sonnet-thinking:
+  model: "claude-3-7-sonnet-20250219"
+  count_model: "claude-3-7-sonnet-20250219"
+  max_tokens: 64000
+  thinking: {
+    "type": "enabled"
+  }
+
+claude-sonnet-4-6:
+  model: "claude-sonnet-4-6"
+  count_model: "claude-sonnet-4-6"
+  max_tokens: 64000
+
+claude-sonnet-4-6-thinking:
+  model: "claude-sonnet-4-6"
+  count_model: "claude-sonnet-4-6"
+  max_tokens: 64000
+  thinking: {
+    "type": "adaptive"
+  }
+  reasoning_effort: "medium"
+
+
+claude-opus-4-6:
+  model: "claude-opus-4-6"
+  count_model: "claude-opus-4-6"
+  max_tokens: 64000
+
+claude-opus-4-6-thinking:
+  model: "claude-opus-4-6"
+  count_model: "claude-opus-4-6"
+  max_tokens: 64000
+  thinking: {
+    "type": "adaptive"
+  }
+  reasoning_effort: "medium"
+
+claude-sonnet-4:
+  model: "claude-sonnet-4-20250514"
+  count_model: "claude-sonnet-4-20250514"
+  max_tokens: 64000
+
+claude-opus-4:
+  model: "claude-opus-4-20250514"
+  count_model: "claude-opus-4-20250514"
+  max_tokens: 64000
+
+gemini-2.0-flash:
+  model: "gemini-2.0-flash"
+  max_output_tokens: 8192
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+gemini-2.0-flash-thinking:
+  model: "gemini-2.0-flash-thinking-exp-01-21"
+  max_output_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+gemini-2.5-flash:
+  model: "gemini-2.5-flash"
+  max_output_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+gemini-2.5-flash-lite:
+  model: "gemini-2.5-flash-lite"
+  max_output_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+gemini-2.5-pro:
+  model: "gemini-2.5-pro-preview-03-25"
+  max_output_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+gemini-3-flash-preview:
+  model: "gemini-3-flash-preview"
+  max_output_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+gemini-3-pro-preview:
+  model: "gemini-3-pro-preview"
+  max_output_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+gemini-3.1-flash-lite-preview:
+  model: "gemini-3.1-flash-lite-preview"
+  max_output_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+gemini-3.1-pro-preview:
+  model: "gemini-3.1-pro-preview"
+  max_output_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  response_mime_type: "text/plain"
+
+doubao-1.5-pro:
+  model: "doubao-1-5-pro-32k-250115"
+  max_tokens: 16384
+  temperature: 0.8
+  top_p: 1
+
+doubao-1.5-thinking-pro:
+  model: "doubao-1-5-thinking-pro-250415"
+  max_tokens: 16384
+  reasoning_effort: "medium"
+
+
+deepseek-r1:
+  model: "deepseek-reasoner"
+  max_completion_tokens: 8192
+  reasoning_effort: "medium"
+
+deepseek-v3:
+  model: "deepseek-chat"
+  max_completion_tokens: 8192
+  temperature: 0.8
+  top_p: 1
+
+# Local SGLang server (OpenAI-compatible). Used for LVM-guided length control experiments.
+sglang-local:
+  model: "default"
+  max_tokens: 6000
+  temperature: 1.0
+  top_p: 0.999
+  extra_body:
+    top_k: 15
+    min_p: 0.0
+  # Enable LVM-guided length control injection (see BaseModel._build_call_args)
+  enable_lvm_length_control: true
+  lvm_target_length_mode: "total"
+  lvm_value_constraint: "eq"
+  # Retry once; long-context errors are deterministic and should not be retried.
+  max_retries: 1
+  lvm_gamma: 0.997
+  system_prompt: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+  # Optional: prepend a fixed prefix to every user prompt.
+  enable_user_prompt_prefix: true
+  user_prompt_prefix: "Please follow the instructions below.\n\n"
+  # Rewrite strict "equal to" wording into "approximately" (EN/CN) for length control.
+  soften_equal_to_wording: false
+  # Which length metric to store in `word_count` for evaluation:
+  # - completion_tokens (default): use OpenAI-style usage.completion_tokens (recommended for SGLang)
+  # - word_count: use benchmark's count_words() (CN chars + EN words)
+  length_metric: "completion_tokens"
+
+# for qwen3-instruct
+sglang-local-1:
+  model: "default"
+  max_tokens: 16000
+  temperature: 1.0
+  top_p: 0.999
+  extra_body:
+    top_k: 15
+    min_p: 0.0
+  # Enable LVM-guided length control injection (see BaseModel._build_call_args)
+  enable_lvm_length_control: true
+  lvm_target_length_mode: "total"
+  lvm_value_constraint: "eq"
+  # Retry once; long-context errors are deterministic and should not be retried.
+  max_retries: 1
+  lvm_gamma: 0.9998
+  # system_prompt: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+  # Optional: prepend a fixed prefix to every user prompt.
+  enable_user_prompt_prefix: true
+  user_prompt_prefix: "Please follow the instructions below.\n\n"
+  # Rewrite strict "equal to" wording into "approximately" (EN/CN) for length control.
+  soften_equal_to_wording: false
+  # Which length metric to store in `word_count` for evaluation:
+  # - completion_tokens (default): use OpenAI-style usage.completion_tokens (recommended for SGLang)
+  # - word_count: use benchmark's count_words() (CN chars + EN words)
+  length_metric: "completion_tokens"
+
+sglang-local-2:
+  model: "default"
+  max_tokens: 6000
+  temperature: 1.0
+  top_p: 0.999
+  extra_body:
+    top_k: 15
+    min_p: 0.0
+  # Enable LVM-guided length control injection (see BaseModel._build_call_args)
+  enable_lvm_length_control: true
+  lvm_target_length_mode: "total"
+  lvm_value_constraint: "eq"
+  # Retry once; long-context errors are deterministic and should not be retried.
+  max_retries: 1
+  lvm_gamma: 0.9997
+  # system_prompt: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+  # Optional: prepend a fixed prefix to every user prompt.
+  enable_user_prompt_prefix: true
+  user_prompt_prefix: "Please follow the instructions below.\n\n"
+  # Rewrite strict "equal to" wording into "approximately" (EN/CN) for length control.
+  soften_equal_to_wording: false
+  # Which length metric to store in `word_count` for evaluation:
+  # - completion_tokens (default): use OpenAI-style usage.completion_tokens (recommended for SGLang)
+  # - word_count: use benchmark's count_words() (CN chars + EN words)
+  length_metric: "completion_tokens"
+
+sglang-local-no-length-control:
+  model: "default"
+  max_tokens: 6000
+  temperature: 1.0
+  top_p: 0.999
+  extra_body:
+    top_k: 15
+    min_p: 0.0
+  # Enable LVM-guided length control injection (see BaseModel._build_call_args)
+  enable_lvm_length_control: false
+  lvm_target_length_mode: "total"
+  # Retry once; long-context errors are deterministic and should not be retried.
+  max_retries: 1
+  lvm_gamma: 0.997
+  system_prompt: ""
+  # Optional: prepend a fixed prefix to every user prompt.
+  enable_user_prompt_prefix: true
+  user_prompt_prefix: "Please follow the instructions below.\n\n"
+  # Rewrite strict "equal to" wording into "approximately" (EN/CN) for length control.
+  soften_equal_to_wording: false
+  # Which length metric to store in `word_count` for evaluation:
+  # - completion_tokens (default): use OpenAI-style usage.completion_tokens (recommended for SGLang)
+  # - word_count: use benchmark's count_words() (CN chars + EN words)
+  length_metric: "completion_tokens"
+
+Llama-3.1-8B-Instruct:
+  model: "../../model/Llama/Meta-Llama-3.1-8B-Instruct"
+  max_length: 131072
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+Llama-3.1-70B-Instruct:
+  model: "../../model/Llama/Llama-3.1-70B-Instruct"
+  max_length: 131072
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+Qwen3-235B-A22B:
+  model: "qwen3-235b-a22b"
+  tokenizer_model: "Qwen/Qwen3-235B-A22B"
+  temperature: 0.8
+  top_p: 1
+  max_completion_tokens: 8192
+  extra_body: {"enable_thinking": False}
+  stream: True
+
+Qwen3-235B-A22B-Thinking:
+  model: "qwen3-235b-a22b"
+  tokenizer_model: "Qwen/Qwen3-235B-A22B-Thinking-2507"
+  max_completion_tokens: 8192
+  extra_body: {"enable_thinking": True}
+  stream: True
+
+Qwen3-235B-A22B-Instruct-2507:
+  model: "qwen3-235b-a22b-instruct-2507"
+  tokenizer_model: "Qwen/Qwen3-235B-A22B-Instruct-2507"
+  temperature: 0.8
+  top_p: 1
+  max_completion_tokens: 8192
+  extra_body: {"enable_thinking": False}
+  stream: False
+
+Qwen3-32B:
+  model: "qwen3-32b"
+  tokenizer_model: "Qwen/Qwen3-32B"
+  max_completion_tokens: 16384
+  top_p: 1
+  extra_body: {"enable_thinking": False}
+  temperature: 0.8
+  stream: True
+
+Qwen3-32B-Thinking:
+  model: "qwen3-32b"
+  tokenizer_model: "Qwen/Qwen3-32B"
+  max_completion_tokens: 16384
+  extra_body: {"enable_thinking": True}
+  stream: True
+
+Qwen2.5-3B-Instruct:
+  model: "../../model/Qwen/Qwen2.5-3B-Instruct"
+  max_new_tokens: 8192
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+Qwen2.5-7B-Instruct:
+  model: "../../model/Qwen/Qwen2.5-7B-Instruct"
+  max_new_tokens: 8192
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+Qwen2.5-72B-Instruct:
+  model: "../../model/Qwen/Qwen2.5-72B-Instruct"
+  max_new_tokens: 8192
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+glm-4-9b:
+  model: "../../model/THUDM/glm-4-9b-chat"
+  max_new_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+Mistral-7B-Instruct:
+  model: "../../model/mistralai/Mistral-7B-Instruct-v0.2"
+  max_length: 32768
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+LongWriter-glm4-9b:
+  model: "../../model/THUDM/LongWriter-glm4-9b"
+  max_new_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+LongWriter-llama3.1-8b:
+  model: "../../model/THUDM/LongWriter-llama3.1-8b"
+  max_new_tokens: 65536
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+suri-i-orpo:
+  model: "../../model/mistralai/Mistral-7B-Instruct-v0.2"
+  finetuned_model: "../../model/Suri/suri-i-orpo"
+  max_length: 32768
+  temperature: 0.8
+  top_p: 1
+  do_sample: True
+
+

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage: bash scripts/remote_slurm_job/submit.sh [--debug] [--dry-run] [--no-sync]
+
+# Convenience wrapper for submitting scripts/remote_slurm_job/train.slurm.
+# - On local machines: optionally sync, then submit over ssh.
+# - On remote machines: submit directly with sbatch.
+
+# Edit the variables near the top of this file to customize the remote path and Slurm resources.
+
+# ================================
+# Remote machine configuration
+# ================================
+# Personal remote machine defaults. Update these for your own remote layout or experiment.
+REMOTE_HOST="your_host"                                 # your ssh address. e.g. login, user@address etc.
+REMOTE_USER="your_username"                             # your username on the remote machine
+REMOTE_BASE="/path/to/your/remote/base/${REMOTE_USER}"  # where the base directory is located
+REMOTE_REPO="$REMOTE_BASE/Length-Value-Model"           # where the repository directory is located
+CACHE_ROOT="/path/to/your/cache/${REMOTE_USER}"         # where the cache directory is located
+PARTITION="your_partition"                              # your Slurm partition. e.g. main, dev, etc.
+ENABLE_MODULE=0                                         # 0 for no module loading, 1 for module loading
+
+# Wrapper behavior flags.
+DO_SYNC=1       # If sync to remote machine is needed.
+DEBUG=0
+DRY_RUN=0
+IS_REMOTE=0     # 0 for local, 1 for remote
+DELETE=1        # If delete the remote machine directory is needed.
+DOWNLOAD_DATA=0
+
+# Slurm resources.
+GPUS=2
+CPUS_PER_TASK=8
+MEMORY="64gb"
+TIME_LIMIT="4:00:00"
+JOB_NAME="lenvm"
+# ================================
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+
+# Sync the repository to remote machine if needed.
+if [[ "$IS_REMOTE" -eq 0 ]] && [[ "$DO_SYNC" -eq 1 ]]; then
+  REMOTE_USER="$REMOTE_USER" \
+  REMOTE_HOST="$REMOTE_HOST" \
+  REMOTE_BASE="$REMOTE_BASE" \
+  REMOTE_REPO="$REMOTE_REPO" \
+  DRY_RUN="$DRY_RUN" \
+  DELETE="$DELETE" \
+    bash "$REPO_ROOT/scripts/remote_slurm_job/sync_to_remote.sh"
+fi
+
+# Submit the job to remote machine environment setup
+REMOTE_PREP="cd '$REMOTE_REPO' && mkdir -p logs"
+SBATCH_EXPORTS="ALL,REMOTE_BASE='$REMOTE_BASE',REMOTE_REPO='$REMOTE_REPO',DEBUG='$DEBUG',DOWNLOAD_DATA='$DOWNLOAD_DATA',CACHE_ROOT='$CACHE_ROOT',ENABLE_MODULE='$ENABLE_MODULE'"
+SBATCH_COMMAND=$(cat <<EOF
+$REMOTE_PREP && sbatch \
+  --job-name='$JOB_NAME' \
+  --partition='$PARTITION' \
+  --gpus='$GPUS' \
+  --cpus-per-task='$CPUS_PER_TASK' \
+  --mem='$MEMORY' \
+  --time='$TIME_LIMIT' \
+  --export=$SBATCH_EXPORTS \
+  scripts/remote_slurm_job/train.slurm
+EOF
+)
+
+# Print the submission command.
+echo "Submitting Remote Environment job"
+echo "  host      : $REMOTE_HOST"
+echo "  repo      : $REMOTE_REPO"
+echo "  slurm     : partition=$PARTITION gpus=$GPUS cpus=$CPUS_PER_TASK mem=$MEMORY time=$TIME_LIMIT"
+if [[ "$IS_REMOTE" -eq 1 ]]; then
+  echo "  mode      : direct sbatch on remote machine"
+else
+  echo "  mode      : local wrapper -> ssh -> sbatch"
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo
+  echo "$SBATCH_COMMAND"
+  exit 0
+fi
+
+# Submit the job to remote machine training
+if [[ "$IS_REMOTE" -eq 1 ]]; then
+  bash -lc "$SBATCH_COMMAND"
+else
+  ssh "$REMOTE_HOST" "$SBATCH_COMMAND"
+fi

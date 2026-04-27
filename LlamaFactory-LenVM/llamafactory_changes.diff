@@ -1,0 +1,288 @@
+Only in /home/guests/zhen/dir1/LenVM/LlamaFactory/examples: train_lvm
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/data/__init__.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/data/__init__.py
+19a20
+>     LengthValueDataCollator,
+30a32
+>     "LengthValueDataCollator",
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/data/collator.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/data/collator.py
+331a332,364
+> 
+> 
+> @dataclass
+> class LengthValueDataCollator(MultiModalDataCollatorForSeq2Seq):
+>     r"""Data collator for length value regression."""
+> 
+>     compute_dtype: "torch.dtype" = torch.float32
+> 
+>     @staticmethod
+>     def _pad_or_truncate(tensor: "torch.Tensor", seq_len: int) -> "torch.Tensor":
+>         pad_len = seq_len - tensor.size(0)
+>         if pad_len < 0:
+>             return tensor[:seq_len]
+>         if pad_len > 0:
+>             return torch.cat((tensor, torch.zeros(pad_len, dtype=tensor.dtype)), dim=0)
+>         return tensor
+> 
+>     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
+>         value_labels = [feature.pop("value_labels") for feature in features]
+>         value_masks = [feature.pop("value_mask") for feature in features]
+>         batch = super().__call__(features)
+>         seq_len = batch["input_ids"].size(1)
+> 
+>         padded_values = []
+>         padded_masks = []
+>         for vals, masks in zip(value_labels, value_masks):
+>             # `value_labels` may contain `inf` (see `value_regression.py`), so we must keep it floating.
+>             padded_values.append(self._pad_or_truncate(torch.tensor(vals, dtype=torch.float32), seq_len))
+>             padded_masks.append(self._pad_or_truncate(torch.tensor(masks, dtype=torch.bool), seq_len))
+> 
+>         batch["value_labels"] = torch.stack(padded_values, dim=0)
+>         batch["value_mask"] = torch.stack(padded_masks, dim=0)
+>         return batch
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/data/loader.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/data/loader.py
+33a34
+>     LengthValueDatasetProcessor,
+169c170
+<     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+---
+>     stage: Literal["pt", "sft", "rm", "ppo", "kto", "lvm"],
+191c192
+<     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+---
+>     stage: Literal["pt", "sft", "rm", "ppo", "kto", "lvm"],
+222a224,225
+>     elif stage == "lvm":
+>         dataset_processor_class = LengthValueDatasetProcessor
+233c236
+<     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+---
+>     stage: Literal["pt", "sft", "rm", "ppo", "kto", "lvm"],
+281c284
+<     stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+---
+>     stage: Literal["pt", "sft", "rm", "ppo", "kto", "lvm"],
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/data/processor/__init__.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/data/processor/__init__.py
+20a21
+> from .value_regression import LengthValueDatasetProcessor
+30a32
+>     "LengthValueDatasetProcessor",
+Only in /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/data/processor: value_regression.py
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/hparams/data_args.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/hparams/data_args.py
+18a19
+> import sys
+140a142,145
+>     )
+>     max_finite_length: int = field(
+>         default=sys.maxsize,
+>         metadata={"help": "The threshold for considering a sequence length as infinite."},
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/hparams/finetuning_args.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/hparams/finetuning_args.py
+460c460
+<     stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto"] = field(
+---
+>     stage: Literal["pt", "sft", "rm", "ppo", "dpo", "kto", "lvm"] = field(
+532a533,582
+>     # Length Value Model (LVM) specific options
+>     lvm_loss_type: Literal["huber", "bce"] = field(
+>         default="huber",
+>         metadata={"help": "Loss type for LVM training. 'huber' uses Huber/MSE on transformed predictions; "
+>                           "'bce' uses binary cross-entropy with logits against target 1-gamma^l."},
+>     )
+>     lvm_huber_loss_delta: float = field(
+>         default=1.0,
+>         metadata={"help": "Delta parameter for Huber (SmoothL1) loss in LVM training."},
+>     )
+>     lvm_gamma: float = field(
+>         default=0.999,
+>         metadata={"help": "Gamma parameter for GAE in LVM training."},
+>     )
+>     lvm_lam: float = field(
+>         default=1.0,
+>         metadata={"help": "Lambda parameter for GAE in LVM training."},
+>     )
+>     lvm_target_type: Literal["discounted_return", "length", "log_length"] = field(
+>         default="discounted_return",
+>         metadata={"help": "Regression target type for LVM training."},
+>     )
+>     lvm_length_normalizer: float = field(
+>         default=1.0,
+>         metadata={"help": "Normalization denominator used only when `lvm_target_type=length`."},
+>     )
+>     lvm_length_activation: Literal["softplus", "sigmoid"] = field(
+>         default="softplus",
+>         metadata={"help": "Activation used only when `lvm_target_type=length`."},
+>     )
+>     lvm_agg_method: Literal["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-mean-max"] = field(
+>         default="token-mean",
+>         metadata={"help": "Method to aggregate the loss in LVM training."},
+>     )
+>     lvm_agg_max_len: float = field(
+>         default=1000.0,
+>         metadata={"help": "Normalization denominator for 'seq-mean-token-mean-max' aggregation (prevents overflow for long sequences)."},
+>     )
+>     lvm_alpha: float = field(
+>         default=0.0,
+>         metadata={"help": "Alpha parameter for LVM training (from VAPO paper)."},
+>     )
+>     lvm_relative_loss: bool = field(
+>         default=False,
+>         metadata={"help": "Whether to use the relative loss in LVM training."},
+>     )
+>     lvm_pos_metrics: list[float] | str = field(
+>         default_factory=lambda: [0.0, 0.25, 0.5, 0.75],
+>         metadata={"help": "Positions (fractions) to log per-position LVM losses, e.g. 0,0.25,0.5,0.75."},
+>     )
+547a598
+>         self.lvm_pos_metrics: list[float] = [float(x) for x in split_arg(self.lvm_pos_metrics)]
+589a641,658
+> 
+>         assert 0.0 < self.lvm_gamma <= 1.0, "gamma must be (0.0, 1.0]"
+>         assert 0.0 <= self.lvm_lam <= 1.0, "lam must be [0.0, 1.0]"
+>         assert self.lvm_target_type in {"discounted_return", "length", "log_length"}, (
+>             "lvm_target_type must be one of {'discounted_return', 'length', 'log_length'}."
+>         )
+>         assert self.lvm_length_normalizer > 0.0, "lvm_length_normalizer must be > 0."
+>         assert self.lvm_length_activation in {"softplus", "sigmoid"}, (
+>             "lvm_length_activation must be one of {'softplus', 'sigmoid'}."
+>         )
+>         assert self.lvm_loss_type in {"huber", "bce"}, "lvm_loss_type must be one of {'huber', 'bce'}."
+>         if self.lvm_loss_type == "bce":
+>             assert self.lvm_target_type == "discounted_return", (
+>                 "lvm_loss_type='bce' only works with lvm_target_type='discounted_return'."
+>             )
+>         assert 0.0 <= self.lvm_huber_loss_delta, "delta must be [0.0, inf)"
+>         for pos in self.lvm_pos_metrics:
+>             assert 0.0 <= pos <= 1.0, "lvm_pos_metrics must be within [0, 1]."
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/hparams/model_args.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/hparams/model_args.py
+203a204,213
+>     valuehead_dropout: float | None = field(
+>         default=None,
+>         metadata={
+>             "help": (
+>                 "Dropout probability for TRL ValueHead (summary_dropout_prob). "
+>                 "Only takes effect when a value head is added (e.g. stage=rm/ppo/lvm). "
+>                 "If unset, TRL defaults to 0.1 for most models."
+>             )
+>         },
+>     )
+262a273,276
+> 
+>         if self.valuehead_dropout is not None:
+>             if not (0.0 <= float(self.valuehead_dropout) <= 1.0):
+>                 raise ValueError("`valuehead_dropout` must be within [0.0, 1.0].")
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/model/loader.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/model/loader.py
+192c192,199
+<         model = AutoModelForCausalLMWithValueHead.from_pretrained(model)
+---
+>         vhead_kwargs: dict[str, Any] = {}
+>         if getattr(model_args, "valuehead_dropout", None) is not None:
+>             summary_dropout_prob = float(model_args.valuehead_dropout)
+>             # Ensure the value head dropout is controllable even for models whose config already defines it.
+>             setattr(model.config, "summary_dropout_prob", summary_dropout_prob)
+>             vhead_kwargs["summary_dropout_prob"] = summary_dropout_prob
+> 
+>         model = AutoModelForCausalLMWithValueHead.from_pretrained(model, **vhead_kwargs)
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/model/patcher.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/model/patcher.py
+18a19
+> import torch.nn as nn
+246a248,283
+>     def num_parameters(
+>         self: "AutoModelForCausalLMWithValueHead", only_trainable: bool = False, exclude_embeddings: bool = False, **kwargs
+>     ) -> int:
+>         r"""Compatibility shim for external loggers (e.g. W&B).
+> 
+>         `trl.AutoModelForCausalLMWithValueHead` does not always expose the same API as `transformers.PreTrainedModel`.
+>         Some integrations call `model.num_parameters()` and will warn if it is missing.
+>         """
+>         base = getattr(self, "pretrained_model", None)
+>         if base is not None and callable(getattr(base, "num_parameters", None)):
+>             try:
+>                 # transformers.PreTrainedModel signature
+>                 return int(base.num_parameters(only_trainable=only_trainable, exclude_embeddings=exclude_embeddings))
+>             except TypeError:
+>                 # other implementations
+>                 try:
+>                     return int(base.num_parameters())
+>                 except Exception:
+>                     pass
+> 
+>         # Fallback: count parameters on the wrapper (includes value head).
+>         def _iter_params(module: torch.nn.Module):
+>             for p in module.parameters():
+>                 if (not only_trainable) or p.requires_grad:
+>                     yield p
+> 
+>         total = sum(p.numel() for p in _iter_params(self))
+>         if exclude_embeddings:
+>             try:
+>                 emb = self.get_input_embeddings()
+>                 if isinstance(emb, torch.nn.Module):
+>                     total -= sum(p.numel() for p in _iter_params(emb))
+>             except Exception:
+>                 pass
+>         return int(total)
+> 
+262a300,345
+>     def load_state_dict(
+>         self: "AutoModelForCausalLMWithValueHead",
+>         state_dict: dict[str, torch.Tensor],
+>         strict: bool = True,
+>         *args,
+>         **kwargs,
+>     ):
+>         r"""Backward-compatible state_dict loading for value-head wrapper.
+> 
+>         Some older checkpoints (and some DeepSpeed ZeRO checkpoints) may store base-model weights as:
+>           - model.* / lm_head.* (HF base model)
+>         while the TRL wrapper expects:
+>           - pretrained_model.model.* / pretrained_model.lm_head.*
+> 
+>         When we detect such a checkpoint, we transparently remap keys so that resuming works.
+>         """
+>         if isinstance(state_dict, dict) and hasattr(self, "pretrained_model"):
+>             keys = list(state_dict.keys())
+>             has_pretrained_prefix = any(k.startswith("pretrained_model.") for k in keys)
+>             has_retrained_prefix = any(k.startswith("retrained_model.") for k in keys)
+>             looks_like_base_model = any(
+>                 k.startswith(("model.", "lm_head.", "transformer.")) for k in keys
+>             )
+> 
+>             # Only rewrite when checkpoint does *not* already contain the expected wrapper prefix.
+>             if (not has_pretrained_prefix) and (has_retrained_prefix or looks_like_base_model):
+>                 remapped: dict[str, torch.Tensor] = {}
+>                 for k, v in state_dict.items():
+>                     # Keep value head and any auxiliary heads/buffers as-is.
+>                     if k.startswith("v_head."):
+>                         remapped[k] = v
+>                         continue
+> 
+>                     # Map `retrained_model.*` -> `pretrained_model.*` (rare but seen in some forks).
+>                     if k.startswith("retrained_model."):
+>                         remapped["pretrained_model." + k[len("retrained_model.") :]] = v
+>                         continue
+> 
+>                     # Default: treat as base-model key and prefix under `pretrained_model.`
+>                     remapped["pretrained_model." + k] = v
+> 
+>                 state_dict = remapped
+> 
+>         # Call the original nn.Module loader.
+>         return nn.Module.load_state_dict(self, state_dict, strict=strict, *args, **kwargs)
+> 
+277a361,365
+>     # Only add the shim if the wrapper doesn't already provide it.
+>     if not (hasattr(model, "num_parameters") and callable(getattr(model, "num_parameters"))):
+>         setattr(model, "num_parameters", MethodType(num_parameters, model))
+>     # Load compatibility shim for checkpoints saved without the `pretrained_model.` prefix.
+>     setattr(model, "load_state_dict", MethodType(load_state_dict, model))
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/train/callbacks.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/train/callbacks.py
+300c300
+<             log_str = f"'loss': {logs['loss']:.4f}, 'learning_rate': {logs['lr']:2.4e}, 'epoch': {logs['epoch']:.2f}"
+---
+>             log_str = f"'loss': {logs['loss']:.6f}, 'learning_rate': {logs['lr']:2.4e}, 'epoch': {logs['epoch']:.2f}"
+Only in /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/train: lvm
+diff -r '--exclude=__pycache__' '--exclude=*.pyc' '--exclude=.git' /tmp/tmp.KypgXJEg3k/repo/src/llamafactory/train/tuner.py /home/guests/zhen/dir1/LenVM/LlamaFactory/src/llamafactory/train/tuner.py
+36a37
+> from .lvm import run_lvm
+101a103,104
+>     elif finetuning_args.stage == "lvm":
+>         run_lvm(model_args, data_args, training_args, finetuning_args, callbacks)
