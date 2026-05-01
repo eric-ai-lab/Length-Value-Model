@@ -123,10 +123,13 @@ Avoid committing large generated artifacts unless explicitly required.
 If you find this work useful, please cite:
 
 ```bibtex
-@misc{zhang2026lengthvaluemodel,
-  title        = {Length Value Model: Scalable Value Pretraining for Token-Level Length Modeling},
-  author       = {Zhen Zhang and Changyi Yang and Zijie Xia and Zhen Yang and Chengzhi Liu and Zhaotiao Weng and Yepeng Liu and Haobo Chen and Jin Pan and Chenyang Zhao and Yuheng Bu and Alkesh Patel and Zhe Gan and Xin Eric Wang},
-  year         = {2026},
-  url          = {https://length-value-model.github.io/}
+@misc{zhang2026lengthvaluemodelscalable,
+      title={Length Value Model: Scalable Value Pretraining for Token-Level Length Modeling}, 
+      author={Zhen Zhang and Changyi Yang and Zijie Xia and Zhen Yang and Chengzhi Liu and Zhaotiao Weng and Yepeng Liu and Haobo Chen and Jin Pan and Chenyang Zhao and Yuheng Bu and Alkesh Patel and Zhe Gan and Xin Eric Wang},
+      year={2026},
+      eprint={2604.27039},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2604.27039}, 
 }
 ```
