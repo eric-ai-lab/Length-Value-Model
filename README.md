@@ -5,7 +5,7 @@
 **Scalable Value Pretraining for Token-Level Length Modeling**
 
 [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://length-value-model.github.io/)
-[![Paper](https://img.shields.io/badge/Paper-PDF-red)](./LenVM_paper.pdf)
+[![Paper](https://img.shields.io/badge/Paper-PDF-red)](https://arxiv.org/abs/2604.27039)
 [![Code](https://img.shields.io/badge/Code-GitHub-green)](https://github.com/eric-ai-lab/Length-Value-Model)
 [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Collection-yellow)](https://huggingface.co/collections/namezz/length-value-model)
 
