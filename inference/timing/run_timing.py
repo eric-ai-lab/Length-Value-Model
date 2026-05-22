@@ -100,12 +100,19 @@ def _stop_gpu_sampler(proc: Optional[subprocess.Popen]) -> None:
 
 
 def _summarize_responses(responses_jsonl: Path) -> Dict[str, Any]:
-    """Aggregate token counts and per-question latency from sample_eval output."""
+    """Aggregate token counts and per-question latency from sample_eval output.
+
+    sample_eval writes one row per choice but duplicates the full-request
+    `usage` field across every choice's row, so we dedupe by question `idx`
+    (counting each request's usage once) before summing. `n_requests` and the
+    per-choice latency stats still sample every row.
+    """
     n_requests = 0
     total_output_tokens = 0
     total_prompt_tokens = 0
     output_token_counts: List[int] = []
     latencies: List[float] = []
+    seen_idx: set = set()
     with responses_jsonl.open() as f:
         for line in f:
             try:
@@ -113,13 +120,16 @@ def _summarize_responses(responses_jsonl: Path) -> Dict[str, Any]:
             except json.JSONDecodeError:
                 continue
             n_requests += 1
-            usage = row.get("usage") or {}
-            out_tok = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-            in_tok = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            total_output_tokens += int(out_tok or 0)
-            total_prompt_tokens += int(in_tok or 0)
-            if out_tok:
-                output_token_counts.append(int(out_tok))
+            idx = row.get("idx")
+            if idx is not None and idx not in seen_idx:
+                seen_idx.add(idx)
+                usage = row.get("usage") or {}
+                out_tok = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+                in_tok = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+                total_output_tokens += int(out_tok or 0)
+                total_prompt_tokens += int(in_tok or 0)
+                if out_tok:
+                    output_token_counts.append(int(out_tok))
             lat = row.get("latency_s") or row.get("elapsed_s")
             if isinstance(lat, (int, float)):
                 latencies.append(float(lat))

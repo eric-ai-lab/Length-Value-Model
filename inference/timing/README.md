@@ -36,6 +36,14 @@ emits one JSONL line with:
 - `t_sample_ms` — sampling kernel
 - `lvm_active`, `batch_size`, `is_greedy`
 
+Theoretical FLOPs are computed by `analyze.py` from the standard `2 * N_params`
+forward-pass rule, using base model + LenVM checkpoint sizes (`flops.py`
+hardcodes the Qwen2.5 family; pass `--base-model` / `--lvm-model` to swap).
+For LenVM the per-output-token cost is `2 * N_base + 2 * N_lvm * (1 + k)`, where
+`k` comes from `top_k` in `meta.json`. Contrasting the theoretical FLOPs ratio
+with the measured wall-clock ratio shows how much of the slowdown is raw
+compute increase vs GPU underutilization.
+
 ## Running it
 
 ```bash
@@ -59,7 +67,7 @@ The script chains three stages:
 - `baseline.timing.jsonl`, `lenvm.timing.jsonl` — per-step records
 - `baseline.meta.json`, `lenvm.meta.json` — wall-clock, token counts, cmdline
 - `baseline.gpu_samples.csv`, `lenvm.gpu_samples.csv` — `nvidia-smi` 1 Hz log
-- `summary.csv`, `summary.json` — aggregated table
+- `summary.csv`, `summary.json` — aggregated table (incl. theoretical FLOPs, achieved TFLOPs/s, ratio row)
 - `per_step_breakdown.png` — stacked bar of sampler-side decomposition
 - `lvm_apply_breakdown.png` — LenVM `apply()` internal breakdown
 

@@ -25,6 +25,8 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from inference.timing.flops import baseline_run_flops, lvm_run_flops, resolve_params
+
 
 _PER_STEP_KEYS = [
     "t_sampler_total_ms",
@@ -104,19 +106,68 @@ def _load_meta(path: Path) -> Dict[str, Any]:
 
 
 def _row_for(tag: str, meta: Dict[str, Any], agg: Dict[str, Any]) -> Dict[str, Any]:
+    summary = meta.get("summary") or {}
     row: Dict[str, Any] = {
         "tag": tag,
         "wall_clock_s": meta.get("wall_clock_s"),
-        "total_output_tokens": (meta.get("summary") or {}).get("total_output_tokens"),
+        "total_output_tokens": summary.get("total_output_tokens"),
+        "total_prompt_tokens": summary.get("total_prompt_tokens"),
         "throughput_output_tokens_per_s": meta.get("throughput_output_tokens_per_s"),
-        "n_requests": (meta.get("summary") or {}).get("n_requests"),
-        "output_tokens_mean": (meta.get("summary") or {}).get("output_tokens_mean"),
-        "output_tokens_p95": (meta.get("summary") or {}).get("output_tokens_p95"),
-        "latency_s_mean": (meta.get("summary") or {}).get("latency_s_mean"),
-        "latency_s_p95": (meta.get("summary") or {}).get("latency_s_p95"),
+        "n_requests": summary.get("n_requests"),
+        "output_tokens_mean": summary.get("output_tokens_mean"),
+        "output_tokens_p95": summary.get("output_tokens_p95"),
+        "latency_s_mean": summary.get("latency_s_mean"),
+        "latency_s_p95": summary.get("latency_s_p95"),
+        "value_scale": meta.get("value_scale"),
+        "top_k": meta.get("top_k"),
     }
     row.update(agg)
     return row
+
+
+def _add_flops(
+    row: Dict[str, Any],
+    *,
+    base_params_b: Optional[float],
+    lvm_params_b: Optional[float],
+    is_lvm: bool,
+) -> None:
+    """Attach theoretical FLOPs + achieved-FLOPs/sec columns to row."""
+    if base_params_b is None:
+        return
+    prompt_t = int(row.get("total_prompt_tokens") or 0)
+    output_t = int(row.get("total_output_tokens") or 0)
+    if not (prompt_t or output_t):
+        return
+    if is_lvm:
+        if lvm_params_b is None:
+            return
+        k = row.get("top_k")
+        if k is None or int(k) < 1:
+            return
+        total = lvm_run_flops(prompt_t, output_t, base_params_b, lvm_params_b, int(k))
+        per_token = (2 * base_params_b + 2 * lvm_params_b * (1 + int(k))) * 1e9
+    else:
+        total = baseline_run_flops(prompt_t, output_t, base_params_b)
+        per_token = 2 * base_params_b * 1e9
+    row["theoretical_gflops_per_output_token"] = per_token / 1e9
+    row["theoretical_pflops_total"] = total / 1e15
+    wall = row.get("wall_clock_s") or 0
+    if wall > 0:
+        row["achieved_tflops_per_s"] = total / wall / 1e12
+
+
+def _ratio_row(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute lenvm / baseline ratios for numeric columns. Assumes rows[0]=baseline, rows[1]=lenvm."""
+    if len(rows) != 2:
+        return {}
+    base, lvm = rows
+    ratio: Dict[str, Any] = {"tag": "ratio (lvm/base)"}
+    for key, b_val in base.items():
+        l_val = lvm.get(key)
+        if isinstance(b_val, (int, float)) and isinstance(l_val, (int, float)) and b_val:
+            ratio[key] = l_val / b_val
+    return ratio
 
 
 def _stacked_bar(rows: List[Dict[str, Any]], out_png: Path) -> Optional[Path]:
@@ -181,8 +232,8 @@ def _lvm_sub_breakdown(rows: List[Dict[str, Any]], out_png: Path) -> Optional[Pa
     return out_png
 
 
-def _print_table(rows: List[Dict[str, Any]]) -> None:
-    cols = [
+def _print_tables(rows: List[Dict[str, Any]]) -> None:
+    timing_cols = [
         ("tag", "tag"),
         ("wall_clock_s", "e2e_s"),
         ("throughput_output_tokens_per_s", "tok/s"),
@@ -193,6 +244,20 @@ def _print_table(rows: List[Dict[str, Any]]) -> None:
         ("t_lvm_apply_outer_ms_mean", "lvm_apply_ms"),
         ("t_sample_ms_mean", "sample_ms"),
     ]
+    flops_cols = [
+        ("tag", "tag"),
+        ("theoretical_gflops_per_output_token", "GFLOPs/tok"),
+        ("theoretical_pflops_total", "PFLOPs(total)"),
+        ("achieved_tflops_per_s", "TFLOPs/s"),
+        ("wall_clock_s", "e2e_s"),
+    ]
+    _print_one(rows, timing_cols)
+    if any("theoretical_gflops_per_output_token" in r for r in rows):
+        print()
+        _print_one(rows, flops_cols)
+
+
+def _print_one(rows: List[Dict[str, Any]], cols: List[tuple]) -> None:
     widths = {k: max(len(label), max(len(_fmt(r.get(k))) for r in rows)) for k, label in cols}
     header = " | ".join(f"{label:>{widths[k]}}" for k, label in cols)
     print(header)
@@ -214,26 +279,48 @@ def main() -> int:
     p.add_argument("--results-dir", type=Path, required=True)
     p.add_argument("--baseline-tag", default="baseline")
     p.add_argument("--lenvm-tag", default="lenvm")
+    p.add_argument(
+        "--base-model",
+        default="Qwen/Qwen2.5-7B-Instruct",
+        help="Base generation model name (for theoretical FLOPs lookup).",
+    )
+    p.add_argument(
+        "--lvm-model",
+        default="namezz/lvm-math-0402-a-qwen2.5-7b-instruct-b-qwen2.5-1.5b-instruct",
+        help="LenVM checkpoint name (for theoretical FLOPs lookup).",
+    )
     args = p.parse_args()
+
+    base_params_b = resolve_params(args.base_model)
+    lvm_params_b = resolve_params(args.lvm_model)
+    if base_params_b is None:
+        print(f"warning: unknown base model '{args.base_model}', skipping FLOPs")
+    if lvm_params_b is None:
+        print(f"warning: unknown LenVM model '{args.lvm_model}', skipping LenVM FLOPs")
 
     rd = args.results_dir
     rows: List[Dict[str, Any]] = []
-    for tag in (args.baseline_tag, args.lenvm_tag):
+    for tag, is_lvm in ((args.baseline_tag, False), (args.lenvm_tag, True)):
         meta = _load_meta(rd / f"{tag}.meta.json")
         records = _filter_warmup(list(_iter_records(rd / f"{tag}.timing.jsonl")))
         agg = _agg(records)
-        rows.append(_row_for(tag, meta, agg))
+        row = _row_for(tag, meta, agg)
+        _add_flops(row, base_params_b=base_params_b, lvm_params_b=lvm_params_b, is_lvm=is_lvm)
+        rows.append(row)
+
+    ratio = _ratio_row(rows)
+    display_rows = rows + ([ratio] if ratio else [])
 
     summary_path = rd / "summary.json"
-    summary_path.write_text(json.dumps(rows, indent=2))
+    summary_path.write_text(json.dumps(display_rows, indent=2))
 
     csv_path = rd / "summary.csv"
-    if rows:
-        keys = sorted({k for r in rows for k in r.keys()})
+    if display_rows:
+        keys = sorted({k for r in display_rows for k in r.keys()})
         with csv_path.open("w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=keys)
             w.writeheader()
-            for r in rows:
+            for r in display_rows:
                 w.writerow({k: r.get(k) for k in keys})
 
     plot_path = _stacked_bar(rows, rd / "per_step_breakdown.png")
@@ -246,7 +333,7 @@ def main() -> int:
     if sub_plot_path:
         print(f"lvm sub-plot -> {sub_plot_path}")
     print()
-    _print_table(rows)
+    _print_tables(display_rows)
     return 0
 
 

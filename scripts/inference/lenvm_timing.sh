@@ -161,6 +161,8 @@ SERVER_PID=""
 
 echo "==> Stage 3: analyze"
 python -m inference.timing.analyze \
-  --results-dir "$RESULTS_DIR"
+  --results-dir "$RESULTS_DIR" \
+  --base-model "$BASE_MODEL" \
+  --lvm-model "$LENVM_MODEL"
 
 echo "Done. Results in $RESULTS_DIR"
