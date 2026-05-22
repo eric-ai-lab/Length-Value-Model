@@ -25,7 +25,11 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from inference.timing.flops import baseline_run_flops, lvm_run_flops, resolve_params
+from inference.timing.flops import (
+    ModelConfig,
+    baseline_run_flops,
+    lvm_extra_flops,
+)
 
 
 _PER_STEP_KEYS = [
@@ -128,30 +132,69 @@ def _row_for(tag: str, meta: Dict[str, Any], agg: Dict[str, Any]) -> Dict[str, A
 def _add_flops(
     row: Dict[str, Any],
     *,
-    base_params_b: Optional[float],
-    lvm_params_b: Optional[float],
+    meta: Dict[str, Any],
+    base_cfg: Optional[ModelConfig],
+    lvm_cfg: Optional[ModelConfig],
     is_lvm: bool,
 ) -> None:
-    """Attach theoretical FLOPs + achieved-FLOPs/sec columns to row."""
-    if base_params_b is None:
+    """Attach layer-level theoretical FLOPs + achieved-FLOPs/sec columns.
+
+    Splits prefill (charged once per unique prompt, assumes SGLang prefix cache)
+    from decode (charged per sample), and breaks each into linear / attention /
+    lm_head components.
+    """
+    if base_cfg is None:
         return
-    prompt_t = int(row.get("total_prompt_tokens") or 0)
-    output_t = int(row.get("total_output_tokens") or 0)
-    if not (prompt_t or output_t):
+    unique_prompts = int(meta.get("max_questions") or 0)
+    samples_per = int(meta.get("n_samples_per_q") or 1)
+    prompt_total = int(row.get("total_prompt_tokens") or 0)
+    output_total = int(row.get("total_output_tokens") or 0)
+    if unique_prompts <= 0 or output_total <= 0:
         return
-    if is_lvm:
-        if lvm_params_b is None:
-            return
+    # total_prompt_tokens is summed once per unique question (dedup in summarize).
+    # total_output_tokens is summed across all samples per question, then summed across questions.
+    mean_prompt = prompt_total / unique_prompts
+    mean_output = output_total / (unique_prompts * samples_per)
+
+    base = baseline_run_flops(
+        base_cfg,
+        unique_prompts=unique_prompts,
+        samples_per_prompt=samples_per,
+        mean_prompt_tokens=mean_prompt,
+        mean_output_tokens=mean_output,
+    )
+    total = base["total"]["total"]
+    row["base_pflops_total"] = total / 1e15
+    row["base_pflops_prefill"] = base["prefill"]["total"] / 1e15
+    row["base_pflops_decode"] = base["decode"]["total"] / 1e15
+    row["base_pflops_linear"] = base["total"]["linear"] / 1e15
+    row["base_pflops_attention"] = base["total"]["attention"] / 1e15
+    row["base_pflops_lm_head"] = base["total"]["lm_head"] / 1e15
+
+    if is_lvm and lvm_cfg is not None:
         k = row.get("top_k")
-        if k is None or int(k) < 1:
-            return
-        total = lvm_run_flops(prompt_t, output_t, base_params_b, lvm_params_b, int(k))
-        per_token = (2 * base_params_b + 2 * lvm_params_b * (1 + int(k))) * 1e9
-    else:
-        total = baseline_run_flops(prompt_t, output_t, base_params_b)
-        per_token = 2 * base_params_b * 1e9
-    row["theoretical_gflops_per_output_token"] = per_token / 1e9
+        if k is not None and int(k) >= 1:
+            extra = lvm_extra_flops(
+                lvm_cfg,
+                unique_prompts=unique_prompts,
+                samples_per_prompt=samples_per,
+                mean_prompt_tokens=mean_prompt,
+                mean_output_tokens=mean_output,
+                k_candidates=int(k),
+            )
+            total += extra["total"]["total"]
+            row["lvm_pflops_prefill"] = extra["lenvm_prefill"]["total"] / 1e15
+            row["lvm_pflops_extend"] = extra["lenvm_extend"]["total"] / 1e15
+            row["lvm_pflops_candidates"] = extra["lenvm_candidates"]["total"] / 1e15
+            row["lvm_pflops_total"] = extra["total"]["total"] / 1e15
+
     row["theoretical_pflops_total"] = total / 1e15
+    # Per-decode-token cost (excluding prefill share) for a quick "GFLOPs/tok" feel
+    decode_total = base["decode"]["total"] + (row.get("lvm_pflops_extend", 0.0) + row.get("lvm_pflops_candidates", 0.0)) * 1e15
+    n_decode_tokens = unique_prompts * samples_per * mean_output
+    if n_decode_tokens > 0:
+        row["theoretical_gflops_per_output_token"] = decode_total / n_decode_tokens / 1e9
+
     wall = row.get("wall_clock_s") or 0
     if wall > 0:
         row["achieved_tflops_per_s"] = total / wall / 1e12
@@ -203,6 +246,47 @@ def _stacked_bar(rows: List[Dict[str, Any]], out_png: Path) -> Optional[Path]:
     return out_png
 
 
+def _flops_component_bar(rows: List[Dict[str, Any]], out_png: Path) -> Optional[Path]:
+    """Stacked bar of theoretical PFLOPs by component (base linear/attn/lm_head + LenVM)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:  # pragma: no cover
+        print(f"matplotlib unavailable, skipping plot: {e}")
+        return None
+
+    if not any(r.get("base_pflops_linear") for r in rows):
+        return None
+
+    labels = [r["tag"] for r in rows]
+    sections = [
+        ("base_pflops_linear",     "base linear (Q/K/V/O + MLP)"),
+        ("base_pflops_attention",  "base attention (QK^T + attn@V)"),
+        ("base_pflops_lm_head",    "base lm_head"),
+        ("lvm_pflops_extend",      "LenVM extend forward"),
+        ("lvm_pflops_candidates",  "LenVM candidate forwards"),
+        ("lvm_pflops_prefill",     "LenVM prefill"),
+    ]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bottoms = [0.0] * len(labels)
+    for key, name in sections:
+        vals = [float(r.get(key) or 0.0) for r in rows]
+        if max(vals) <= 0:
+            continue
+        ax.bar(labels, vals, bottom=bottoms, label=name)
+        bottoms = [b + v for b, v in zip(bottoms, vals)]
+    for i, total in enumerate(bottoms):
+        ax.text(i, total, f"{total:.2f} PFLOPs", ha="center", va="bottom")
+    ax.set_ylabel("Theoretical FLOPs (PFLOPs)")
+    ax.set_title("Theoretical inference FLOPs by component")
+    ax.legend(loc="upper left", fontsize="small")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=140)
+    plt.close(fig)
+    return out_png
+
+
 def _lvm_sub_breakdown(rows: List[Dict[str, Any]], out_png: Path) -> Optional[Path]:
     try:
         import matplotlib
@@ -244,17 +328,34 @@ def _print_tables(rows: List[Dict[str, Any]]) -> None:
         ("t_lvm_apply_outer_ms_mean", "lvm_apply_ms"),
         ("t_sample_ms_mean", "sample_ms"),
     ]
-    flops_cols = [
+    flops_total_cols = [
         ("tag", "tag"),
         ("theoretical_gflops_per_output_token", "GFLOPs/tok"),
-        ("theoretical_pflops_total", "PFLOPs(total)"),
+        ("base_pflops_total", "base PFLOPs"),
+        ("lvm_pflops_total", "lvm PFLOPs"),
+        ("theoretical_pflops_total", "total PFLOPs"),
         ("achieved_tflops_per_s", "TFLOPs/s"),
         ("wall_clock_s", "e2e_s"),
     ]
+    flops_component_cols = [
+        ("tag", "tag"),
+        ("base_pflops_linear", "base.linear"),
+        ("base_pflops_attention", "base.attn"),
+        ("base_pflops_lm_head", "base.lm_head"),
+        ("base_pflops_prefill", "base.prefill"),
+        ("base_pflops_decode", "base.decode"),
+        ("lvm_pflops_prefill", "lvm.prefill"),
+        ("lvm_pflops_extend", "lvm.extend"),
+        ("lvm_pflops_candidates", "lvm.cands"),
+    ]
     _print_one(rows, timing_cols)
-    if any("theoretical_gflops_per_output_token" in r for r in rows):
+    if any("theoretical_pflops_total" in r for r in rows):
         print()
-        _print_one(rows, flops_cols)
+        print("== FLOPs headline ==")
+        _print_one(rows, flops_total_cols)
+        print()
+        print("== FLOPs by component (PFLOPs) ==")
+        _print_one(rows, flops_component_cols)
 
 
 def _print_one(rows: List[Dict[str, Any]], cols: List[tuple]) -> None:
@@ -291,12 +392,24 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    base_params_b = resolve_params(args.base_model)
-    lvm_params_b = resolve_params(args.lvm_model)
-    if base_params_b is None:
-        print(f"warning: unknown base model '{args.base_model}', skipping FLOPs")
-    if lvm_params_b is None:
-        print(f"warning: unknown LenVM model '{args.lvm_model}', skipping LenVM FLOPs")
+    base_cfg: Optional[ModelConfig] = None
+    lvm_cfg: Optional[ModelConfig] = None
+    try:
+        base_cfg = ModelConfig.load(args.base_model)
+    except FileNotFoundError as e:
+        print(f"warning: {e}; skipping baseline FLOPs")
+    try:
+        lvm_cfg = ModelConfig.load(args.lvm_model)
+    except FileNotFoundError as e:
+        print(f"warning: {e}; skipping LenVM FLOPs")
+    if base_cfg is not None:
+        print(f"base config (source={base_cfg.source}): L={base_cfg.num_hidden_layers} d={base_cfg.hidden_size} "
+              f"Hq={base_cfg.num_attention_heads} Hkv={base_cfg.num_key_value_heads} h={base_cfg.head_dim} "
+              f"ff={base_cfg.intermediate_size} V={base_cfg.vocab_size}")
+    if lvm_cfg is not None:
+        print(f"lvm config  (source={lvm_cfg.source}): L={lvm_cfg.num_hidden_layers} d={lvm_cfg.hidden_size} "
+              f"Hq={lvm_cfg.num_attention_heads} Hkv={lvm_cfg.num_key_value_heads} h={lvm_cfg.head_dim} "
+              f"ff={lvm_cfg.intermediate_size} V={lvm_cfg.vocab_size}")
 
     rd = args.results_dir
     rows: List[Dict[str, Any]] = []
@@ -305,7 +418,7 @@ def main() -> int:
         records = _filter_warmup(list(_iter_records(rd / f"{tag}.timing.jsonl")))
         agg = _agg(records)
         row = _row_for(tag, meta, agg)
-        _add_flops(row, base_params_b=base_params_b, lvm_params_b=lvm_params_b, is_lvm=is_lvm)
+        _add_flops(row, meta=meta, base_cfg=base_cfg, lvm_cfg=lvm_cfg, is_lvm=is_lvm)
         rows.append(row)
 
     ratio = _ratio_row(rows)
@@ -325,13 +438,16 @@ def main() -> int:
 
     plot_path = _stacked_bar(rows, rd / "per_step_breakdown.png")
     sub_plot_path = _lvm_sub_breakdown(rows, rd / "lvm_apply_breakdown.png")
+    flops_plot_path = _flops_component_bar(rows, rd / "flops_breakdown.png")
 
-    print(f"summary.json -> {summary_path}")
-    print(f"summary.csv  -> {csv_path}")
+    print(f"summary.json   -> {summary_path}")
+    print(f"summary.csv    -> {csv_path}")
     if plot_path:
-        print(f"plot         -> {plot_path}")
+        print(f"timing plot    -> {plot_path}")
     if sub_plot_path:
-        print(f"lvm sub-plot -> {sub_plot_path}")
+        print(f"lvm sub-plot   -> {sub_plot_path}")
+    if flops_plot_path:
+        print(f"flops plot     -> {flops_plot_path}")
     print()
     _print_tables(display_rows)
     return 0

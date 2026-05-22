@@ -36,13 +36,25 @@ emits one JSONL line with:
 - `t_sample_ms` — sampling kernel
 - `lvm_active`, `batch_size`, `is_greedy`
 
-Theoretical FLOPs are computed by `analyze.py` from the standard `2 * N_params`
-forward-pass rule, using base model + LenVM checkpoint sizes (`flops.py`
-hardcodes the Qwen2.5 family; pass `--base-model` / `--lvm-model` to swap).
-For LenVM the per-output-token cost is `2 * N_base + 2 * N_lvm * (1 + k)`, where
-`k` comes from `top_k` in `meta.json`. Contrasting the theoretical FLOPs ratio
-with the measured wall-clock ratio shows how much of the slowdown is raw
-compute increase vs GPU underutilization.
+Theoretical FLOPs are computed by `analyze.py` at the layer level. `flops.py`
+loads each model's `config.json` (HF cache or local dir; falls back to
+hardcoded Qwen2.5 dims if missing) and counts:
+
+- per-layer linear matmuls: Q / K / V / O projections (GQA-aware) + SwiGLU MLP
+  (gate + up + down)
+- per-layer attention compute: `2 * H_q * head_dim * seq_len` for each of
+  Q@K^T and attn@V (so attention contribution scales with position)
+- `lm_head`: `2 * hidden * vocab`
+
+A baseline run is split into prefill (charged once per unique prompt, since
+SGLang prefix caching is on by default) and decode (per sample). A LenVM run
+adds, per generated token, one `tree_value_extend` forward plus `k`
+candidate forwards through the value model. The analyzer reports both the
+total PFLOPs and a per-component split so the linear / attention / lm_head
+shares of the baseline are visible alongside the LenVM-specific overhead.
+Contrasting the theoretical FLOPs ratio with the measured wall-clock ratio
+shows how much of the slowdown is raw compute increase vs GPU
+underutilization.
 
 ## Running it
 
@@ -70,6 +82,8 @@ The script chains three stages:
 - `summary.csv`, `summary.json` — aggregated table (incl. theoretical FLOPs, achieved TFLOPs/s, ratio row)
 - `per_step_breakdown.png` — stacked bar of sampler-side decomposition
 - `lvm_apply_breakdown.png` — LenVM `apply()` internal breakdown
+- `flops_breakdown.png` — stacked bar of theoretical FLOPs by component
+  (base linear / attention / lm_head + LenVM extend / candidates / prefill)
 
 ## Caveats
 
