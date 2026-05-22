@@ -15,6 +15,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.common import dynamic_import
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.lvm.lvm_value_utils import force_eos_value_zero, get_eos_token_ids
+from sglang.srt.lvm.timing import get_timer
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req
@@ -1765,37 +1766,49 @@ class LvmGuidedSampler:
         Returns the modified probs tensor, or None when no guidance is needed
         (caller should use the original probs).
         """
+        timer = get_timer()
         inproc = self._get_inproc_provider()
         if inproc not in (None, False):
             # Free KV cache for requests that have finished or aborted
             inproc.clean_stale_requests(set(r.rid for r in reqs))
 
+        t_bp = timer.section_start("t_lvm_build_pending_ms")
         pending = self._build_pending(probs, reqs, temperatures, top_ps, top_ks, min_ps)
+        timer.section_end("t_lvm_build_pending_ms", t_bp)
         if pending is None:
             return None
 
         if pending.send_batch_indices:
             reqs_send = [pending.req_list[i] for i in pending.send_batch_indices]
+            timer.set_meta(lvm_n_reqs_with_guidance=len(reqs_send))
             if pending.gpu_candidates is not None:
                 # GPU fast path (synchronous).
                 if inproc not in (None, False):
                     try:
                         rids_send = [req.rid for req in reqs_send]
+                        t_fwd = timer.section_start("t_lvm_forward_ms")
                         inproc.tree_value_extend(rids_send, pending.prefix_ids_send, reqs_send)
                         gpu_emb = inproc.tree_value_launch_gpu(
                             rids_send, pending.candidate_ids_send, gpu_candidates=pending.gpu_candidates
                         )
                         gpu_embeddings = inproc.tree_value_collect_gpu(gpu_emb)
+                        timer.section_end("t_lvm_forward_ms", t_fwd)
+                        t_ag = timer.section_start("t_lvm_apply_guidance_ms")
                         self._apply_guidance_gpu(pending, gpu_embeddings)
+                        timer.section_end("t_lvm_apply_guidance_ms", t_ag)
                         return pending.guided
                     except Exception as exc:
                         raise RuntimeError("LenVM GPU guidance path failed") from exc
 
+            t_fwd = timer.section_start("t_lvm_forward_ms")
             lvm_values = self._post_tree_value(
                 [req.rid for req in reqs_send], pending.prefix_ids_send, pending.candidate_ids_send, reqs_send
             )
+            timer.section_end("t_lvm_forward_ms", t_fwd)
             if lvm_values is None:
                 return None
+            t_ag = timer.section_start("t_lvm_apply_guidance_ms")
             self._apply_guidance(pending, lvm_values)
+            timer.section_end("t_lvm_apply_guidance_ms", t_ag)
 
         return pending.guided

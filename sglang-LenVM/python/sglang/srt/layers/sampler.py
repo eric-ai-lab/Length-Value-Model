@@ -17,6 +17,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 from sglang.srt.lvm.lvm_guided_sampling import LvmGuidedSampler
+from sglang.srt.lvm.timing import get_timer
 
 if is_cuda():
     from sgl_kernel import (
@@ -45,6 +46,7 @@ class Sampler(nn.Module):
         self.lvm_guided_sampler = LvmGuidedSampler.from_server_args(
             get_global_server_args(), model_runner=model_runner
         )
+        self._timer = get_timer()
 
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
@@ -134,6 +136,10 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
+        t_total = self._timer.section_start("t_sampler_total_ms")
+        guided_applied = False
+        batch_size_meta = int(logits_output.next_token_logits.shape[0])
+
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)
@@ -145,6 +151,7 @@ class Sampler(nn.Module):
             if return_logprob:
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         else:
+            t_pre = self._timer.section_start("t_pre_lvm_ms")
             can_sample_directly_from_probs = (
                 not sampling_info.need_top_p_sampling
                 and not sampling_info.need_top_k_sampling
@@ -181,7 +188,9 @@ class Sampler(nn.Module):
             probs = logits
             del logits
 
-            guided_applied = False
+            self._timer.section_end("t_pre_lvm_ms", t_pre)
+
+            t_lvm = self._timer.section_start("t_lvm_apply_outer_ms")
             if self.lvm_guided_sampler is not None and sampling_info.reqs is not None:
                 guided_probs = self.lvm_guided_sampler.apply(
                     probs,
@@ -194,10 +203,12 @@ class Sampler(nn.Module):
                 if guided_probs is not None:
                     probs = guided_probs
                     guided_applied = True
+            self._timer.section_end("t_lvm_apply_outer_ms", t_lvm)
 
             if guided_applied:
                 can_sample_directly_from_probs = True
 
+            t_sample = self._timer.section_start("t_sample_ms")
             if can_sample_directly_from_probs:
                 # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
                 batch_next_token_ids = sampling_from_probs_torch(
@@ -244,6 +255,7 @@ class Sampler(nn.Module):
                     raise ValueError(
                         f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
                     )
+            self._timer.section_end("t_sample_ms", t_sample)
 
             if return_logprob:
                 if get_global_server_args().rl_on_policy_target is not None:
@@ -291,6 +303,13 @@ class Sampler(nn.Module):
                 group=self.tp_sync_group,
             )
 
+        self._timer.section_end("t_sampler_total_ms", t_total)
+        self._timer.set_meta(
+            lvm_active=bool(guided_applied),
+            batch_size=batch_size_meta,
+            is_greedy=bool(sampling_info.is_all_greedy),
+        )
+        self._timer.flush_step()
         return batch_next_token_ids
 
     def compute_logprobs_only(
