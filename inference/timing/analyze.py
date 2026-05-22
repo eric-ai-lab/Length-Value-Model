@@ -405,11 +405,11 @@ def main() -> int:
     if base_cfg is not None:
         print(f"base config (source={base_cfg.source}): L={base_cfg.num_hidden_layers} d={base_cfg.hidden_size} "
               f"Hq={base_cfg.num_attention_heads} Hkv={base_cfg.num_key_value_heads} h={base_cfg.head_dim} "
-              f"ff={base_cfg.intermediate_size} V={base_cfg.vocab_size}")
+              f"ff={base_cfg.intermediate_size} V={base_cfg.vocab_size} head={base_cfg.head_type}")
     if lvm_cfg is not None:
         print(f"lvm config  (source={lvm_cfg.source}): L={lvm_cfg.num_hidden_layers} d={lvm_cfg.hidden_size} "
               f"Hq={lvm_cfg.num_attention_heads} Hkv={lvm_cfg.num_key_value_heads} h={lvm_cfg.head_dim} "
-              f"ff={lvm_cfg.intermediate_size} V={lvm_cfg.vocab_size}")
+              f"ff={lvm_cfg.intermediate_size} V={lvm_cfg.vocab_size} head={lvm_cfg.head_type}")
 
     rd = args.results_dir
     rows: List[Dict[str, Any]] = []

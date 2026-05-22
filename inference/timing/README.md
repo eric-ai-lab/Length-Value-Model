@@ -7,6 +7,38 @@ This exists to answer the question raised in the LenVM paper review: how much
 wall-clock overhead does LenVM-guided decoding add on top of vanilla decoding,
 and where does that overhead live inside each decoding step?
 
+## TL;DR results
+
+Reference configuration: 1× H100 SXM, Qwen2.5-7B-Instruct base + the
+`lvm-math-0402-a-qwen2.5-7b-instruct-b-qwen2.5-1.5b-instruct` value model,
+GSM8K 50 questions × 16 samples, `max_tokens=6000`, T=1.0, top-p=1.0,
+baseline `top_k=-1`, LenVM `top_k=5`, value-scale 0 (paper config).
+
+| metric | baseline | LenVM | ratio |
+| --- | ---: | ---: | ---: |
+| end-to-end wall clock (s) | 19.22 | 87.44 | **4.55× slower** |
+| throughput (output tok/s) | 12,366 | 2,719 | **4.55× drop** |
+| mean `Sampler.forward` (ms / step) | 0.19 | 50.31 | **268×** |
+| theoretical GFLOPs / output token | 14.24 | 30.24 | **2.12×** |
+| achieved throughput (TFLOPs/s) | 179.9 | 83.2 | 0.46× |
+| H100 bf16 peak utilization | ~18% | ~9% | — |
+
+`Sampler.forward` breakdown (mean ms / step): pre-LVM 0.07 → 0.14,
+`LvmGuidedSampler.apply` 0.00 → 50.03 (build_pending 12.3, LenVM forward 36.6,
+apply_guidance 5.3), sample kernel 0.12 → 0.17. The LenVM `apply()` call is
+~99% of the per-step latency delta; pre-LVM and sample-kernel costs are
+unchanged.
+
+FLOPs breakdown (PFLOPs over the run): baseline.linear 3.17, base.attention
+0.02, base.lm_head 0.26 — same for both runs. LenVM adds extend 0.63 +
+candidates 3.17 + prefill 0.01 = 3.82 PFLOPs extra. Of the extra cost,
+~83% is the `top_k=5` candidate forwards through the 1.5B value model.
+
+**Conclusion**: LenVM nearly doubles the theoretical compute (2.10× total
+PFLOPs) and slows wall clock by 4.55×. Half of the slowdown is genuine
+extra compute; the other half is GPU underutilization (CPU candidate prep
+stalls, separate-stream sync, smaller effective batch on the value model).
+
 ## What gets measured
 
 Two server lifecycles drive the comparison, so per-step instrumentation only
@@ -94,5 +126,17 @@ The script chains three stages:
   at production batch sizes the residual is small but visible at low load.
 - Single-rank only. For TP/DP > 1 the timer writes from one rank; extend the
   log filename with the rank suffix if you need per-worker traces.
+- LenVM-extra FLOPs assume **independent single-token forwards** for each of
+  the `k` candidates per generated token. This matches the current
+  sglang-LenVM in-proc path (`tree_value_extend` extends KV once, then
+  each candidate is a separate single-token forward attending to the shared
+  prefix cache). If a future implementation batches all `k` candidates into
+  one forward and amortizes some MLP/attention cost, pass
+  `candidate_cost_multiplier < 1.0` to `lvm_extra_flops` to scale that term.
+- LenVM head cost uses the small `MLP2SiLUValueHead` (`d*d + d*out_dim`) not
+  the base model's `lm_head` (`d * vocab_size`). `ModelConfig.load(...)`
+  auto-detects this by checking for `value_head.safetensors` next to
+  `config.json` or `LengthValueModel`/`ValueModel`/`ValueHead` in the
+  config's `architectures`. Force the choice via `head_type=...` if needed.
 - Wall-clock comparisons assume both servers see the same prompts at the same
   concurrency. Run them back-to-back on a quiet GPU.

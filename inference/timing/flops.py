@@ -65,10 +65,19 @@ class ModelConfig:
     head_dim: int
     intermediate_size: int
     vocab_size: int
+    # Head type used at the top of the stack. "lm_head" = 2*d*V vocab projection
+    # (standard causal LM). "value_head" = small MLP -> scalar (LenVM checkpoints
+    # ship a MLP2SiLUValueHead: d->d Linear + d->1 Linear, see
+    # sglang/srt/models/qwen2_lvm.py::MLP2SiLUValueHead).
+    head_type: str = "lm_head"
+    value_head_hidden: Optional[int] = None  # MLP hidden dim if head_type == "value_head"
+    value_head_out_dim: int = 1
     source: str = ""
 
     @classmethod
-    def from_dict(cls, cfg: dict, source: str = "") -> "ModelConfig":
+    def from_dict(cls, cfg: dict, source: str = "", *, head_type: str = "lm_head",
+                  value_head_hidden: Optional[int] = None,
+                  value_head_out_dim: int = 1) -> "ModelConfig":
         d = cfg["hidden_size"]
         Hq = cfg["num_attention_heads"]
         Hkv = cfg.get("num_key_value_heads", Hq)
@@ -81,18 +90,33 @@ class ModelConfig:
             head_dim=h,
             intermediate_size=cfg["intermediate_size"],
             vocab_size=cfg["vocab_size"],
+            head_type=head_type,
+            value_head_hidden=value_head_hidden if value_head_hidden is not None else d,
+            value_head_out_dim=value_head_out_dim,
             source=source,
         )
 
     @classmethod
-    def load(cls, name_or_path: str) -> "ModelConfig":
-        """Locate config.json for a HF model name or a local path."""
+    def load(cls, name_or_path: str, *, head_type: str = "auto",
+             value_head_out_dim: int = 1) -> "ModelConfig":
+        """Locate config.json for a HF model name or a local path.
+
+        head_type="auto" (default) inspects the directory for value_head.safetensors,
+        treating its presence as a LenVM-style value-head checkpoint. Pass
+        head_type="value_head" or "lm_head" to force the choice.
+        """
         cfg_path = _find_config_json(name_or_path)
         if cfg_path is not None:
-            return cls.from_dict(json.loads(cfg_path.read_text()), source=str(cfg_path))
+            cfg_dict = json.loads(cfg_path.read_text())
+            ht = head_type if head_type != "auto" else _autodetect_head(cfg_path.parent, cfg_dict)
+            return cls.from_dict(
+                cfg_dict,
+                source=str(cfg_path),
+                head_type=ht,
+                value_head_out_dim=value_head_out_dim,
+            )
         fb = _FALLBACK_CONFIGS.get(name_or_path)
         if fb is None:
-            # Strip leading "./" and try basename matches
             base = name_or_path.rstrip("/").split("/")[-1]
             for key, val in _FALLBACK_CONFIGS.items():
                 if key.split("/")[-1] == base:
@@ -103,7 +127,21 @@ class ModelConfig:
                 f"Could not locate config.json for {name_or_path!r} and no fallback "
                 f"dimensions are registered. Add one to _FALLBACK_CONFIGS."
             )
-        return cls.from_dict(fb, source=f"fallback:{name_or_path}")
+        ht = head_type if head_type != "auto" else "lm_head"
+        return cls.from_dict(fb, source=f"fallback:{name_or_path}", head_type=ht,
+                             value_head_out_dim=value_head_out_dim)
+
+
+def _autodetect_head(model_dir: Path, cfg_dict: dict) -> str:
+    """Return 'value_head' if a value_head.safetensors sits next to config.json,
+    or the loaded architecture is a known value-head class. Otherwise 'lm_head'.
+    """
+    if (model_dir / "value_head.safetensors").exists():
+        return "value_head"
+    for arch in cfg_dict.get("architectures", []) or []:
+        if "LengthValueModel" in arch or "ValueModel" in arch or "ValueHead" in arch:
+            return "value_head"
+    return "lm_head"
 
 
 def _find_config_json(name_or_path: str) -> Optional[Path]:
@@ -126,6 +164,12 @@ def _find_config_json(name_or_path: str) -> Optional[Path]:
                 cfg = snap / "config.json"
                 if cfg.exists():
                     return cfg
+    # Local download dir convention (download_data_and_model.sh writes here):
+    if "/" in name_or_path and not name_or_path.startswith("."):
+        local_dir = Path("./models") / name_or_path
+        cfg = local_dir / "config.json"
+        if cfg.exists():
+            return cfg
     return None
 
 
@@ -153,14 +197,33 @@ def per_layer_attn_compute_flops(cfg: ModelConfig, seq_len: int) -> int:
 
 
 def lm_head_flops(cfg: ModelConfig) -> int:
+    """Vocab projection 2 * hidden * vocab_size."""
     return 2 * cfg.hidden_size * cfg.vocab_size
+
+
+def value_head_flops(cfg: ModelConfig) -> int:
+    """MLP2SiLUValueHead: hidden->hidden (fc) + hidden->out_dim (summary).
+
+    SiLU activation is negligible vs the two matmuls. The summary projection
+    is tiny when out_dim=1 (the default) but kept for completeness.
+    """
+    fc = 2 * cfg.hidden_size * (cfg.value_head_hidden or cfg.hidden_size)
+    summary = 2 * (cfg.value_head_hidden or cfg.hidden_size) * cfg.value_head_out_dim
+    return fc + summary
+
+
+def head_flops(cfg: ModelConfig) -> int:
+    """FLOPs at the top of the stack, dispatched by ModelConfig.head_type."""
+    if cfg.head_type == "value_head":
+        return value_head_flops(cfg)
+    return lm_head_flops(cfg)
 
 
 def forward_token_flops(cfg: ModelConfig, position: int) -> Dict[str, int]:
     """Decompose one decode-step FLOPs at the given (1-indexed) position."""
     lin = per_layer_linear_flops(cfg) * cfg.num_hidden_layers
     attn = per_layer_attn_compute_flops(cfg, position) * cfg.num_hidden_layers
-    lmh = lm_head_flops(cfg)
+    lmh = head_flops(cfg)
     return {"linear": lin, "attention": attn, "lm_head": lmh, "total": lin + attn + lmh}
 
 
@@ -176,7 +239,7 @@ def prefill_flops(cfg: ModelConfig, prompt_len: int) -> Dict[str, int]:
     lin = per_layer_linear_flops(cfg) * cfg.num_hidden_layers * prompt_len
     attn_per_layer = 2 * 2 * cfg.num_attention_heads * cfg.head_dim * prompt_len * (prompt_len + 1) // 2
     attn = attn_per_layer * cfg.num_hidden_layers
-    lmh = lm_head_flops(cfg) * prompt_len
+    lmh = head_flops(cfg) * prompt_len
     return {"linear": lin, "attention": attn, "lm_head": lmh, "total": lin + attn + lmh}
 
 
@@ -185,7 +248,7 @@ def decode_flops_sum(cfg: ModelConfig, prompt_len: int, output_len: int) -> Dict
     if output_len <= 0:
         return {"linear": 0, "attention": 0, "lm_head": 0, "total": 0}
     lin_per_token = per_layer_linear_flops(cfg) * cfg.num_hidden_layers
-    lmh_per_token = lm_head_flops(cfg)
+    lmh_per_token = head_flops(cfg)
     # Closed-form: sum_{t=1..L} (prompt_len + t) = L*prompt_len + L*(L+1)/2
     pos_sum = output_len * prompt_len + output_len * (output_len + 1) // 2
     attn = 2 * 2 * cfg.num_attention_heads * cfg.head_dim * pos_sum * cfg.num_hidden_layers
@@ -229,17 +292,34 @@ def lvm_extra_flops(
     mean_prompt_tokens: float,
     mean_output_tokens: float,
     k_candidates: int,
+    candidate_cost_multiplier: float = 1.0,
 ) -> Dict[str, int]:
-    """LenVM-only extra FLOPs (on top of baseline). Per generated token:
-       one extend (1 forward) + k candidates (k forwards).
+    """LenVM-only extra FLOPs (on top of baseline) per output token:
+
+    * one ``tree_value_extend`` forward (catch the value-model KV up with the
+      just-accepted token; a single-token decode at the current position).
+    * ``k_candidates`` value-model forwards (score the top-k candidate tokens;
+      each is a single-token decode at the position right after the extend).
+
+    ``candidate_cost_multiplier`` is a knob for future LenVM implementations
+    that share work across candidates (e.g. batched single-forward scoring
+    that amortizes some MLP / attention cost across the k candidates). The
+    default of ``1.0`` matches the current sglang-LenVM in-proc path, where
+    each candidate is a separate single-token forward sharing only the
+    extended KV cache. Set to e.g. ``0.6`` if a future implementation can
+    batch the k candidates into one forward.
+
+    Whether ``cfg.head_type`` is ``lm_head`` or ``value_head`` controls
+    whether each forward is charged the 2*d*V vocab projection (causal LM)
+    or the much smaller MLP2SiLUValueHead (LenVM checkpoints).
     """
     pre = prefill_flops(cfg, int(round(mean_prompt_tokens)))
     dec = decode_flops_sum(cfg, int(round(mean_prompt_tokens)), int(round(mean_output_tokens)))
+    candidate_scale = unique_prompts * samples_per_prompt * k_candidates * candidate_cost_multiplier
     out = {
-        "lenvm_prefill": {k: v * unique_prompts for k, v in pre.items()},
-        # Each output token triggers 1 extend at that position + k candidate forwards.
-        "lenvm_extend":     {k: v * unique_prompts * samples_per_prompt              for k, v in dec.items()},
-        "lenvm_candidates": {k: v * unique_prompts * samples_per_prompt * k_candidates for k, v in dec.items()},
+        "lenvm_prefill":    {k: v * unique_prompts for k, v in pre.items()},
+        "lenvm_extend":     {k: v * unique_prompts * samples_per_prompt for k, v in dec.items()},
+        "lenvm_candidates": {k: int(v * candidate_scale) for k, v in dec.items()},
     }
     out["total"] = {k: out["lenvm_prefill"][k] + out["lenvm_extend"][k] + out["lenvm_candidates"][k] for k in pre.keys()}
     return out
