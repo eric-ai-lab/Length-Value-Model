@@ -77,22 +77,23 @@ class Qwen2_5_VLForLengthValueModel(Qwen2_5_VLForConditionalGeneration):
         )
 
         if prefix_lens is not None and cand_lens is not None:
-            extend_lens = forward_batch.extend_seq_lens.tolist()
             cached_prefix_lens = (
-                forward_batch.extend_prefix_lens.tolist()
-                if forward_batch.extend_prefix_lens is not None
-                else [0] * len(extend_lens)
+                getattr(spec, "tree_value_cached_prefix_lens", None)
+                or [0] * len(prefix_lens)
             )
 
             out: list[torch.Tensor] = []
             offset = 0
-            for i, ext_len in enumerate(extend_lens):
+            for i, (prefix_len, cand_len, cached_prefix_len) in enumerate(
+                zip(prefix_lens, cand_lens, cached_prefix_lens)
+            ):
+                prefix_len = int(prefix_len)
+                cand_len = int(cand_len)
+                cached_prefix_len = int(cached_prefix_len)
+                ext_len = max(prefix_len - cached_prefix_len, 0) + cand_len
                 vals_i = token_values[offset : offset + ext_len]
                 offset += ext_len
 
-                prefix_len = int(prefix_lens[i])
-                cand_len = int(cand_lens[i])
-                cached_prefix_len = int(cached_prefix_lens[i])
                 cand_offset = max(prefix_len - cached_prefix_len, 0)
                 out.append(vals_i[cand_offset : cand_offset + cand_len])
             return EmbeddingPoolerOutput(embeddings=out)

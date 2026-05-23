@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -30,6 +32,103 @@ if is_npu():
     import torch_npu
 
 logger = logging.getLogger(__name__)
+
+_SAMPLER_TIMING_TOTALS: Dict[str, float] = {}
+_SAMPLER_TIMING_COUNTS: Dict[str, int] = {}
+_SAMPLER_TIMING_EVENTS: Dict[str, int] = {}
+
+
+def _sampler_timing_enabled() -> bool:
+    return os.environ.get("SGLANG_LVM_TIMING", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _sampler_timing_interval() -> int:
+    raw = os.environ.get("SGLANG_LVM_TIMING_INTERVAL", "200")
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        return 200
+
+
+def _sampler_timing_skip_calls() -> int:
+    raw = os.environ.get("SGLANG_LVM_TIMING_SKIP_CALLS", "0")
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return 0
+
+
+def _sampler_timing_tic() -> float:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _sampler_timing_toc(sample: Optional[Dict[str, float]], name: str, tic: float) -> None:
+    if sample is None:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    sample[name] = sample.get(name, 0.0) + (time.perf_counter() - tic) * 1000.0
+
+
+def _record_sampler_timing(
+    sample: Optional[Dict[str, float]], *, guided_applied: bool = False
+) -> None:
+    if sample is None:
+        return
+
+    seen = _SAMPLER_TIMING_EVENTS.get("_seen", 0) + 1
+    _SAMPLER_TIMING_EVENTS["_seen"] = seen
+    if seen <= _sampler_timing_skip_calls():
+        return
+
+    for key, value in sample.items():
+        _SAMPLER_TIMING_TOTALS[key] = _SAMPLER_TIMING_TOTALS.get(key, 0.0) + float(value)
+        _SAMPLER_TIMING_COUNTS[key] = _SAMPLER_TIMING_COUNTS.get(key, 0) + 1
+
+    _SAMPLER_TIMING_EVENTS["calls"] = _SAMPLER_TIMING_EVENTS.get("calls", 0) + 1
+    if guided_applied:
+        _SAMPLER_TIMING_EVENTS["guided"] = _SAMPLER_TIMING_EVENTS.get("guided", 0) + 1
+
+    calls = _SAMPLER_TIMING_EVENTS["calls"]
+    if calls % _sampler_timing_interval() != 0:
+        return
+
+    forward_avg = _SAMPLER_TIMING_TOTALS.get("sampler_forward", 0.0) / max(
+        _SAMPLER_TIMING_COUNTS.get("sampler_forward", 0), 1
+    )
+    ordered = (
+        "sampler_forward",
+        "preprocess_logits",
+        "temperature",
+        "token_temp_scale",
+        "softmax",
+        "lvm_apply",
+        "sample_direct",
+        "sample_backend",
+        "logprob",
+        "tp_sync",
+    )
+    pieces = [
+        f"calls={calls}",
+        f"guided={_SAMPLER_TIMING_EVENTS.get('guided', 0)}",
+    ]
+    for name in ordered:
+        count = _SAMPLER_TIMING_COUNTS.get(name, 0)
+        if count <= 0:
+            continue
+        avg = _SAMPLER_TIMING_TOTALS[name] / count
+        if name == "sampler_forward" or forward_avg <= 0:
+            pieces.append(f"{name}={avg:.3f}ms")
+        else:
+            pieces.append(f"{name}={avg:.3f}ms/{avg / forward_avg * 100:.1f}%")
+    logger.info("[sampler_timing] %s", " ".join(pieces))
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
@@ -134,16 +233,26 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
+        timing_sample = {} if _sampler_timing_enabled() else None
+        t_forward = _sampler_timing_tic() if timing_sample is not None else 0.0
+        guided_applied = False
+
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)
+        t = _sampler_timing_tic() if timing_sample is not None else 0.0
         logits = self._preprocess_logits(logits, sampling_info)
+        _sampler_timing_toc(timing_sample, "preprocess_logits", t)
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
+            t = _sampler_timing_tic() if timing_sample is not None else 0.0
             batch_next_token_ids = torch.argmax(logits, -1)
+            _sampler_timing_toc(timing_sample, "sample_direct", t)
             if return_logprob:
+                t = _sampler_timing_tic() if timing_sample is not None else 0.0
                 logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+                _sampler_timing_toc(timing_sample, "logprob", t)
         else:
             can_sample_directly_from_probs = (
                 not sampling_info.need_top_p_sampling
@@ -164,25 +273,31 @@ class Sampler(nn.Module):
                 )
 
             # Post process logits
+            t = _sampler_timing_tic() if timing_sample is not None else 0.0
             logits.div_(sampling_info.temperatures)
+            _sampler_timing_toc(timing_sample, "temperature", t)
 
             # Per-token temperature scaling: for boosted tokens, divide their
             # logits by an additional divisor (equivalent to temperature T/d).
             # Done in-place on logits before softmax — zero overhead on the
             # subsequent sampling path.
             if self.lvm_guided_sampler is not None and sampling_info.reqs is not None:
+                t = _sampler_timing_tic() if timing_sample is not None else 0.0
                 self._apply_token_temp_scale(logits, sampling_info.reqs)
+                _sampler_timing_toc(timing_sample, "token_temp_scale", t)
 
             # For ascend backend, softmax is not needed before sampling
             if not get_global_server_args().sampling_backend == "ascend" or (
                 return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB
             ):
+                t = _sampler_timing_tic() if timing_sample is not None else 0.0
                 logits[:] = torch.softmax(logits, dim=-1)
+                _sampler_timing_toc(timing_sample, "softmax", t)
             probs = logits
             del logits
 
-            guided_applied = False
             if self.lvm_guided_sampler is not None and sampling_info.reqs is not None:
+                t = _sampler_timing_tic() if timing_sample is not None else 0.0
                 guided_probs = self.lvm_guided_sampler.apply(
                     probs,
                     sampling_info.reqs,
@@ -191,6 +306,7 @@ class Sampler(nn.Module):
                     sampling_info.top_ks,
                     sampling_info.min_ps,
                 )
+                _sampler_timing_toc(timing_sample, "lvm_apply", t)
                 if guided_probs is not None:
                     probs = guided_probs
                     guided_applied = True
@@ -200,12 +316,15 @@ class Sampler(nn.Module):
 
             if can_sample_directly_from_probs:
                 # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
+                t = _sampler_timing_tic() if timing_sample is not None else 0.0
                 batch_next_token_ids = sampling_from_probs_torch(
                     probs,
                     sampling_seed=sampling_info.sampling_seed,
                     positions=positions,
                 )
+                _sampler_timing_toc(timing_sample, "sample_direct", t)
             else:
+                t = _sampler_timing_tic() if timing_sample is not None else 0.0
                 if get_global_server_args().sampling_backend == "flashinfer":
                     if sampling_info.need_min_p_sampling:
                         probs = top_k_renorm_prob(probs, sampling_info.top_ks)
@@ -244,8 +363,10 @@ class Sampler(nn.Module):
                     raise ValueError(
                         f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
                     )
+                _sampler_timing_toc(timing_sample, "sample_backend", t)
 
             if return_logprob:
+                t = _sampler_timing_tic() if timing_sample is not None else 0.0
                 if get_global_server_args().rl_on_policy_target is not None:
                     logprobs = logprobs_via_logsoftmax_kernel
                     del logprobs_via_logsoftmax_kernel
@@ -257,6 +378,7 @@ class Sampler(nn.Module):
                     del probs_without_temp_scaling
                 else:
                     logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
+                _sampler_timing_toc(timing_sample, "logprob", t)
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
@@ -285,12 +407,16 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
+            t = _sampler_timing_tic() if timing_sample is not None else 0.0
             torch.distributed.all_reduce(
                 batch_next_token_ids,
                 op=dist.ReduceOp.MIN,
                 group=self.tp_sync_group,
             )
+            _sampler_timing_toc(timing_sample, "tp_sync", t)
 
+        _sampler_timing_toc(timing_sample, "sampler_forward", t_forward)
+        _record_sampler_timing(timing_sample, guided_applied=guided_applied)
         return batch_next_token_ids
 
     def compute_logprobs_only(

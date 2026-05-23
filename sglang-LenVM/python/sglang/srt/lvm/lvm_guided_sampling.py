@@ -5,6 +5,7 @@ import importlib
 import importlib.util
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, List, Optional
 
@@ -25,6 +26,127 @@ except Exception:  # pragma: no cover
     orjson = None
 
 logger = logging.getLogger(__name__)
+
+_LVM_TIMING_TOTALS: dict[str, float] = {}
+_LVM_TIMING_COUNTS: dict[str, int] = {}
+_LVM_TIMING_EVENTS: dict[str, int] = {}
+
+
+def _lvm_timing_enabled() -> bool:
+    return os.environ.get("SGLANG_LVM_TIMING", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _lvm_timing_interval() -> int:
+    raw = os.environ.get("SGLANG_LVM_TIMING_INTERVAL", "200")
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        return 200
+
+
+def _lvm_timing_skip_calls() -> int:
+    raw = os.environ.get("SGLANG_LVM_TIMING_SKIP_CALLS", "0")
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return 0
+
+
+def _lvm_timing_tic() -> float:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _lvm_timing_toc(sample: Optional[dict[str, float]], name: str, tic: float) -> None:
+    if sample is None:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    sample[name] = sample.get(name, 0.0) + (time.perf_counter() - tic) * 1000.0
+
+
+def _record_lvm_timing(
+    sample: Optional[dict[str, float]],
+    *,
+    skipped: bool = False,
+    pending: Optional["PendingLvmResult"] = None,
+    gpu_path: bool = False,
+    fused_path: bool = False,
+) -> None:
+    if sample is None:
+        return
+
+    seen = _LVM_TIMING_EVENTS.get("_seen", 0) + 1
+    _LVM_TIMING_EVENTS["_seen"] = seen
+    if seen <= _lvm_timing_skip_calls():
+        return
+
+    for key, value in sample.items():
+        _LVM_TIMING_TOTALS[key] = _LVM_TIMING_TOTALS.get(key, 0.0) + float(value)
+        _LVM_TIMING_COUNTS[key] = _LVM_TIMING_COUNTS.get(key, 0) + 1
+
+    _LVM_TIMING_EVENTS["apply_calls"] = _LVM_TIMING_EVENTS.get("apply_calls", 0) + 1
+    if skipped:
+        _LVM_TIMING_EVENTS["skipped"] = _LVM_TIMING_EVENTS.get("skipped", 0) + 1
+    if gpu_path:
+        _LVM_TIMING_EVENTS["gpu_path"] = _LVM_TIMING_EVENTS.get("gpu_path", 0) + 1
+    if fused_path:
+        _LVM_TIMING_EVENTS["fused_path"] = _LVM_TIMING_EVENTS.get("fused_path", 0) + 1
+
+    if pending is not None:
+        n_send = len(pending.send_batch_indices)
+        if pending.candidate_lens_send is not None:
+            n_cands = sum(int(x) for x in pending.candidate_lens_send)
+        else:
+            n_cands = sum(len(x) for x in pending.candidate_ids_send)
+        _LVM_TIMING_EVENTS["send_rows"] = _LVM_TIMING_EVENTS.get("send_rows", 0) + n_send
+        _LVM_TIMING_EVENTS["candidates"] = _LVM_TIMING_EVENTS.get("candidates", 0) + n_cands
+
+    calls = _LVM_TIMING_EVENTS["apply_calls"]
+    if calls % _lvm_timing_interval() != 0:
+        return
+
+    apply_avg = _LVM_TIMING_TOTALS.get("apply_total", 0.0) / max(
+        _LVM_TIMING_COUNTS.get("apply_total", 0), 1
+    )
+    ordered = (
+        "apply_total",
+        "precheck",
+        "get_inproc_provider",
+        "clean_stale",
+        "build_pending",
+        "extend_launch_fused",
+        "extend_prefix",
+        "launch_candidates",
+        "collect_gpu",
+        "apply_guidance_gpu",
+        "post_tree_value",
+        "apply_guidance_cpu",
+    )
+    pieces = [
+        f"calls={calls}",
+        f"skipped={_LVM_TIMING_EVENTS.get('skipped', 0)}",
+        f"gpu_path={_LVM_TIMING_EVENTS.get('gpu_path', 0)}",
+        f"fused={_LVM_TIMING_EVENTS.get('fused_path', 0)}",
+        f"avg_send_rows={_LVM_TIMING_EVENTS.get('send_rows', 0) / max(calls, 1):.2f}",
+        f"avg_candidates={_LVM_TIMING_EVENTS.get('candidates', 0) / max(calls, 1):.2f}",
+    ]
+    for name in ordered:
+        count = _LVM_TIMING_COUNTS.get(name, 0)
+        if count <= 0:
+            continue
+        avg = _LVM_TIMING_TOTALS[name] / count
+        if name == "apply_total" or apply_avg <= 0:
+            pieces.append(f"{name}={avg:.3f}ms")
+        else:
+            pieces.append(f"{name}={avg:.3f}ms/{avg / apply_avg * 100:.1f}%")
+    logger.info("[lvm_timing] %s", " ".join(pieces))
 
 
 def _get_req_custom_params(req: Any) -> dict[str, Any]:
@@ -112,6 +234,33 @@ def _extract_value_mode(kwargs: dict, default: str = "mul") -> str:
             f"Invalid LenVM parameter 'mode/value_mode': expected one of {sorted(valid_modes)}, got {mode!r}"
         )
     return mode
+
+
+def _get_req_value_mode_and_scale(req: Any) -> tuple[str, float]:
+    """Return cached expectation-guidance mode/scale for a request."""
+    custom_params = _get_req_custom_params(req)
+    cache_key = (
+        id(custom_params),
+        custom_params.get("mode"),
+        custom_params.get("value_mode"),
+        custom_params.get("scale"),
+        custom_params.get("value_scale"),
+    )
+    cached = getattr(req, "_lvm_value_mode_scale_cache", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 3
+        and cached[0] == cache_key
+    ):
+        return cached[1], cached[2]
+
+    mode = _extract_value_mode({"req": req}, default="mul")
+    scale = _extract_value_scale({"req": req}, default=1.0)
+    try:
+        setattr(req, "_lvm_value_mode_scale_cache", (cache_key, mode, scale))
+    except Exception:
+        pass
+    return mode, scale
 
 
 def _extract_length_gamma(kwargs: dict, default: float = 0.997) -> float:
@@ -748,19 +897,22 @@ class LvmGuidedConfig:
 class PendingLvmResult:
     """Intermediate state produced by _build_pending() and consumed by apply().
 
-    Carries filtered candidate lists, the cloned probs tensor (with deterministic
+    Carries filtered candidate lists, the mutable probs tensor (with deterministic
     rows already filled), and optional GPU tensors for the fast guidance path.
     """
 
     req_list: List[Any]
     device: torch.device
-    # probs.clone() with deterministic (single-candidate) rows already zeroed/filled.
+    # Probs tensor with deterministic (single-candidate) rows already zeroed/filled.
     # None means there is nothing to do (all rows were deterministic or skipped).
     guided: Optional[torch.Tensor]
     send_batch_indices: List[int]
     prefix_ids_send: List[List[int]]
     candidate_ids_send: List[List[int]]
     candidate_probs_send: List[List[float]]
+    # Candidate lengths for the GPU fast path. This lets the in-process runner
+    # avoid copying every candidate id back to CPU just to recover per-row sizes.
+    candidate_lens_send: Optional[List[int]] = None
     # GPU tensors for the fast path (only set when the guidance function can use the
     # expectation-guidance GPU path and all send indices come from the top-k path,
     # not top-k-all).
@@ -1027,7 +1179,11 @@ class LvmGuidedSampler:
                 return out
 
             def tree_value_launch_gpu(
-                self, rids: List[str], candidate_ids: List[List[int]], gpu_candidates: Optional[tuple] = None
+                self,
+                rids: List[str],
+                candidate_ids: List[List[int]],
+                gpu_candidates: Optional[tuple] = None,
+                candidate_lens: Optional[List[int]] = None,
             ):
                 """Like tree_value_launch() but keeps embeddings on GPU (no PCIe copy)."""
                 self.lvm_stream.wait_stream(torch.cuda.current_stream())
@@ -1037,12 +1193,70 @@ class LvmGuidedSampler:
                         rids,
                         candidate_ids,
                         gpu_candidates=gpu_candidates,
+                        candidate_lens_per_req=candidate_lens,
                         mrope_deltas=self._mrope_deltas if self.is_vlm else None,
                     )
                     # embeddings stay on GPU — no PCIe copy.
                     self.embed_ready.record(self.lvm_stream)
                 
                 return embeddings  # GPU tensor(s), not yet safe from default stream
+
+            def tree_value_extend_and_launch_gpu(
+                self,
+                rids: List[str],
+                prefix_ids: List[List[int]],
+                _reqs: List[Req],
+                candidate_ids: List[List[int]],
+                gpu_candidates: Optional[tuple] = None,
+                candidate_lens: Optional[List[int]] = None,
+            ):
+                """Fuse tiny prefix extension and candidate scoring into one forward.
+
+                Returns None when fusion is not appropriate, so callers can fall
+                back to the two-phase path.
+                """
+                if self.is_vlm:
+                    return None
+                if (
+                    getattr(
+                        self.incremental_runner.runner.token_to_kv_pool_allocator,
+                        "page_size",
+                        1,
+                    )
+                    != 1
+                ):
+                    return None
+
+                new_tokens_list: List[List[int]] = []
+                for rid, p_ids in zip(rids, prefix_ids):
+                    cached_len = self.incremental_runner.kv_mgr.kv_len(rid)
+                    target_len = len(p_ids)
+                    if target_len < cached_len:
+                        self.incremental_runner.kv_mgr.retract(rid, target_len)
+                        cached_len = target_len
+
+                    if target_len > cached_len:
+                        new_tokens = p_ids[cached_len:]
+                    else:
+                        new_tokens = []
+                    if len(new_tokens) > 1:
+                        return None
+                    new_tokens_list.append(new_tokens)
+
+                self.lvm_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.lvm_stream):
+                    embeddings = (
+                        self.incremental_runner.extend_and_eval_candidates_batch_gpu(
+                            rids,
+                            new_tokens_list,
+                            candidate_ids,
+                            gpu_candidates=gpu_candidates,
+                            candidate_lens_per_req=candidate_lens,
+                        )
+                    )
+                    self.embed_ready.record(self.lvm_stream)
+
+                return embeddings
 
             def tree_value_collect_gpu(self, gpu_embeddings):
                 """Insert a stream dependency so the default stream waits for lvm_stream."""
@@ -1169,7 +1383,32 @@ class LvmGuidedSampler:
             "cmp",
             "op",
         )
-        return any(k in custom_params for k in keys)
+        if not any(k in custom_params for k in keys):
+            return False
+
+        hard_constraint_keys = (
+            "target_value",
+            "target_length",
+            "value_constraint",
+            "constraint",
+            "cmp",
+            "op",
+        )
+        if any(k in custom_params for k in hard_constraint_keys):
+            return True
+
+        try:
+            mode, scale = _get_req_value_mode_and_scale(req)
+        except ValueError:
+            # Preserve existing behavior: invalid explicit params should surface
+            # when guidance is built rather than silently disabling LenVM.
+            return True
+
+        if mode in ("centered_exp", "value_bias"):
+            return not math.isclose(scale, 0.0, rel_tol=0.0, abs_tol=1e-12)
+        if mode == "mul" and scale <= 0.0:
+            return False
+        return not math.isclose(scale, 1.0, rel_tol=0.0, abs_tol=1e-12)
 
     @staticmethod
     def _extract_entropy_threshold(req: Any) -> Optional[float]:
@@ -1284,6 +1523,7 @@ class LvmGuidedSampler:
         top_ps: torch.Tensor,
         top_ks: torch.Tensor,
         min_ps: torch.Tensor,
+        enable_gpu_candidate_compact: bool = False,
     ) -> Optional["PendingLvmResult"]:
         """Filter candidates and build a PendingLvmResult without contacting the LVM.
 
@@ -1297,9 +1537,15 @@ class LvmGuidedSampler:
 
         # Identify which rows actually want value guidance.
         guided_rows: List[int] = []
+        entropy_threshold_by_row: dict[int, float] = {}
+        has_entropy_threshold = False
         for i, req in enumerate(req_list):
             if self._req_wants_value_guidance(req):
                 guided_rows.append(i)
+                thr = self._extract_entropy_threshold(req)
+                if thr is not None:
+                    entropy_threshold_by_row[i] = float(thr)
+                    has_entropy_threshold = True
 
         # If nobody requested value guidance, do nothing and let normal sampling proceed.
         if not guided_rows:
@@ -1316,6 +1562,7 @@ class LvmGuidedSampler:
         candidate_ids_send: List[List[int]] = []
         send_batch_indices: List[int] = []
         candidate_probs_send: List[List[float]] = []
+        candidate_lens_send: List[int] = []
         deterministic_rows: List[tuple[int, int]] = []
 
         # Split rare slow-path (top_k == ALL) from the common (top_k is small).
@@ -1326,16 +1573,21 @@ class LvmGuidedSampler:
         # without any hard target_value/target_length constraints, and all sequences
         # use top-k (not top-k-all), so we can keep tensors on GPU.
         has_hard_target = any(
-            _extract_target_value({"req": req_list[ridx]}) is not None
-            for ridx in range(len(req_list))
+            any(
+                _get_req_custom_params(req_list[ridx]).get(k) is not None
+                for k in ("target_value", "target_length")
+            )
+            for ridx in guided_rows
         )
-        _use_gpu_path = self._fn in (
-            lvm_expectation_guidance,
-            lvm_combined_guidance,
-        ) and not bool(mask_all.any().item()) and not has_hard_target
+        _use_gpu_path = (
+            self._fn in (lvm_expectation_guidance, lvm_combined_guidance)
+            and enable_gpu_candidate_compact
+            and not bool(mask_all.any().item())
+            and not has_hard_target
+        )
         # Will hold (vals_send_gpu, idx_send_gpu) for the top-k send rows, on GPU.
-        _gpu_vals_chunks: List[torch.Tensor] = []
-        _gpu_idx_chunks: List[torch.Tensor] = []
+        _gpu_vals_send: Optional[torch.Tensor] = None
+        _gpu_idx_send: Optional[torch.Tensor] = None
 
         # ---------------------------
         # Fast path: batched top-k -> top-p/min-p/entropy on the top-k subset.
@@ -1393,21 +1645,24 @@ class LvmGuidedSampler:
             ).view(-1)
 
             # Optional entropy-based skip (per request, Python-sourced thresholds).
-            rows_topk_list: List[int] = rows_topk_t.detach().cpu().tolist()
-            thr_list: List[float] = []
-            has_thr = torch.zeros(len(rows_topk_list), device=device, dtype=torch.bool)
-            for j, ridx in enumerate(rows_topk_list):
-                thr = self._extract_entropy_threshold(req_list[ridx])
-                if thr is None:
-                    thr_list.append(float("nan"))
-                else:
-                    thr_list.append(float(thr))
-                    has_thr[j] = True
+            skip_entropy = torch.zeros_like(det_mask, dtype=torch.bool)
+            rows_topk_list: Optional[List[int]] = None
+            if has_entropy_threshold:
+                rows_topk_list = rows_topk_t.detach().cpu().tolist()
+                thr_list: List[float] = []
+                has_thr = torch.zeros(
+                    len(rows_topk_list), device=device, dtype=torch.bool
+                )
+                for j, ridx in enumerate(rows_topk_list):
+                    thr = entropy_threshold_by_row.get(ridx)
+                    if thr is None:
+                        thr_list.append(float("nan"))
+                    else:
+                        thr_list.append(float(thr))
+                        has_thr[j] = True
 
-            # Use float64 for value-guidance gating to avoid precision loss in entropy comparisons.
-            thr_t = torch.tensor(thr_list, device=device, dtype=torch.float64)
-            skip_entropy = torch.zeros_like(has_thr, dtype=torch.bool)
-            if bool(has_thr.any().item()):
+                # Use float64 for stable entropy comparisons.
+                thr_t = torch.tensor(thr_list, device=device, dtype=torch.float64)
                 p = vals.to(torch.float64)
                 s = p.sum(dim=-1)
                 # Avoid division by 0; counts==0 already fixed.
@@ -1420,6 +1675,8 @@ class LvmGuidedSampler:
 
             # Materialize deterministic rows in Python list.
             if bool(det_mask.any().item()):
+                if rows_topk_list is None:
+                    rows_topk_list = rows_topk_t.detach().cpu().tolist()
                 det_token_ids_cpu = det_token_ids.detach().cpu().tolist()
                 det_mask_cpu = det_mask.detach().cpu().tolist()
                 for j, is_det in enumerate(det_mask_cpu):
@@ -1432,38 +1689,49 @@ class LvmGuidedSampler:
                 # Keep GPU slices before moving to CPU (used by GPU guidance fast path).
                 vals_send_gpu = vals[send_mask]  # [B_topk_send, K_max], GPU
                 idx_send_gpu = topk_idx[send_mask]  # [B_topk_send, K_max], GPU
-                idx_send = idx_send_gpu.detach().cpu()
-                # GPU fast path: only need bool mask (4x smaller than float32 transfer).
-                # CPU path: need full float values for candidate_probs_send.
+                rows_send_list = rows_send_t.detach().cpu().tolist()
+
                 if _use_gpu_path:
-                    valid_mask_send = (vals_send_gpu > 0).detach().cpu()
+                    # For the GPU path, keep candidate ids/probs/masks on device.
+                    # Only copy one integer per guided row to CPU so ForwardBatch
+                    # can be built without materializing per-candidate Python lists.
+                    counts_send_list = counts[send_mask].detach().cpu().tolist()
+                    for j, ridx in enumerate(rows_send_list):
+                        n_cands = int(counts_send_list[j])
+                        if n_cands <= 1:
+                            raise RuntimeError(
+                                "Internal LenVM candidate filtering error: "
+                                f"send row has {n_cands} candidates"
+                            )
+
+                        prefix = self._get_prefix_ids_incremental(req_list[ridx])
+                        prefix_ids_send.append(prefix)
+                        candidate_lens_send.append(n_cands)
+                        send_batch_indices.append(ridx)
+
+                    _gpu_vals_send = vals_send_gpu
+                    _gpu_idx_send = idx_send_gpu
                 else:
+                    idx_send = idx_send_gpu.detach().cpu()
+                    # CPU path needs full candidate ids and probs as Python lists.
                     vals_send = vals_send_gpu.detach().cpu()
 
-                rows_send_list = rows_send_t.detach().cpu().tolist()
-                for j, ridx in enumerate(rows_send_list):
-                    # In practice (sorted desc + thresholding), non-zeros are a prefix. Still, use mask for safety.
-                    if _use_gpu_path:
-                        m = valid_mask_send[j]
-                    else:
+                    for j, ridx in enumerate(rows_send_list):
+                        # In practice (sorted desc + thresholding), non-zeros
+                        # are a prefix. Still, use mask for safety.
                         m = vals_send[j] > 0
-                    cand_ids = idx_send[j][m].tolist()
-                    if len(cand_ids) <= 1:
-                        # Should have been caught by det_mask, but keep a safe fallback.
-                        if len(cand_ids) == 1:
-                            deterministic_rows.append((ridx, int(cand_ids[0])))
-                        continue
+                        cand_ids = idx_send[j][m].tolist()
+                        if len(cand_ids) <= 1:
+                            # Should have been caught by det_mask, but keep a safe fallback.
+                            if len(cand_ids) == 1:
+                                deterministic_rows.append((ridx, int(cand_ids[0])))
+                            continue
 
-                    prefix = self._get_prefix_ids_incremental(req_list[ridx])
-                    prefix_ids_send.append(prefix)
-                    candidate_ids_send.append(cand_ids)
-                    if not _use_gpu_path:
+                        prefix = self._get_prefix_ids_incremental(req_list[ridx])
+                        prefix_ids_send.append(prefix)
+                        candidate_ids_send.append(cand_ids)
                         candidate_probs_send.append(vals_send[j][m].tolist())
-                    send_batch_indices.append(ridx)
-                    if _use_gpu_path:
-                        # Capture GPU row j for later gpu_candidates assembly.
-                        _gpu_vals_chunks.append(vals_send_gpu[j].unsqueeze(0))
-                        _gpu_idx_chunks.append(idx_send_gpu[j].unsqueeze(0))
+                        send_batch_indices.append(ridx)
 
         # ---------------------------
         # Slow path: top_k == ALL (full vocab filtering). Rare; keep correctness-oriented CPU behavior.
@@ -1512,19 +1780,36 @@ class LvmGuidedSampler:
         if not send_batch_indices and not deterministic_rows:
             return None
 
-        # Build guided tensor and fill deterministic rows immediately.
-        guided = probs.clone()
+        # Reuse the caller-owned probability tensor. The sampler consumes the guided
+        # distribution after apply() returns, so a full [batch, vocab] clone is avoidable.
+        guided = probs
 
         # Fill deterministic rows (single candidate) without contacting LVM.
         for i, tok in deterministic_rows:
             guided[i].zero_()
             guided[i, tok] = 1.0
 
+        modified_rows = set(send_batch_indices)
+        modified_rows.update(i for i, _tok in deterministic_rows)
+        if len(modified_rows) < len(req_list):
+            top_ks_cpu = top_ks.detach().cpu().tolist()
+            top_ps_cpu = top_ps.detach().cpu().tolist()
+            min_ps_cpu = min_ps.detach().cpu().tolist()
+            for i in range(len(req_list)):
+                if i in modified_rows:
+                    continue
+                top_k_i = int(top_ks_cpu[i])
+                top_p_i = float(top_ps_cpu[i])
+                min_p_i = float(min_ps_cpu[i])
+                if top_k_i == TOP_K_ALL and top_p_i >= 1.0 and min_p_i <= 0.0:
+                    continue
+                guided[i].copy_(self._filter_probs(guided[i], top_k_i, top_p_i, min_p_i))
+
         # Assemble GPU candidate tensors for the fast guidance path.
         gpu_candidates = None
-        if _use_gpu_path and _gpu_vals_chunks:
-            gp = torch.cat(_gpu_vals_chunks, dim=0).float()  # [B_send, K_max]
-            gi = torch.cat(_gpu_idx_chunks, dim=0)  # [B_send, K_max]
+        if _use_gpu_path and _gpu_vals_send is not None and candidate_lens_send:
+            gp = _gpu_vals_send.float()  # [B_send, K_max]
+            gi = _gpu_idx_send  # [B_send, K_max]
             gm = gp > 0  # [B_send, K_max] bool
             gpu_candidates = (gp, gi, gm)
 
@@ -1536,6 +1821,7 @@ class LvmGuidedSampler:
             prefix_ids_send=prefix_ids_send,
             candidate_ids_send=candidate_ids_send,
             candidate_probs_send=candidate_probs_send,
+            candidate_lens_send=candidate_lens_send or None,
             gpu_candidates=gpu_candidates,
         )
 
@@ -1581,11 +1867,12 @@ class LvmGuidedSampler:
         modes_list: List[str] = []
         for ridx in pending.send_batch_indices:
             req = pending.req_list[ridx]
-            scales_list.append(_extract_value_scale({"req": req}))
-            modes_list.append(_extract_value_mode({"req": req}, default="mul"))
+            mode, scale = _get_req_value_mode_and_scale(req)
+            scales_list.append(scale)
+            modes_list.append(mode)
 
-        # Use the most common mode; fall back to "mul" if mixed (rare).
-        mode = modes_list[0] if len(set(modes_list)) == 1 else "mul"
+        same_mode = len(set(modes_list)) == 1
+        mode = modes_list[0] if same_mode else None
         scale_t = torch.tensor(scales_list, device=device, dtype=torch.float32)  # [B]
 
         # -- Sigmoid of raw embeddings → values in [0, 1] ---------------------------
@@ -1612,7 +1899,88 @@ class LvmGuidedSampler:
         max_v = values.masked_fill(~valid_mask, -1e9).max(dim=-1).values  # [B]
         v_range = (max_v - min_v).clamp(min=1e-8)  # [B]
 
-        if mode == "centered_exp":
+        if not same_mode:
+            final_probs = p_norm.clone()
+            for bi, mode_i in enumerate(modes_list):
+                valid_i = valid_mask[bi]
+                scale_i = scale_t[bi]
+                if mode_i == "centered_exp":
+                    logits = values[bi] * scale_i
+                    logits = logits.masked_fill(~valid_i, -1e9)
+                    logits = logits - logits.max().view(())
+                    w = (p_norm[bi] * torch.exp(logits)).masked_fill(~valid_i, 0.0)
+                    final_probs[bi] = w / w.sum().clamp(min=1e-20)
+                    continue
+
+                if mode_i == "value_bias":
+                    logits = emb[bi] * scale_i
+                    logits = logits.masked_fill(~valid_i, -1e9)
+                    logits = logits - logits.max().view(())
+                    w = (p_norm[bi] * torch.exp(logits)).masked_fill(~valid_i, 0.0)
+                    final_probs[bi] = w / w.sum().clamp(min=1e-20)
+                    continue
+
+                if mode_i not in ("exp", "linear", "length_mul", "mul"):
+                    raise ValueError(f"[LVM GPU path] Unknown value_mode: {mode_i!r}")
+
+                if mode_i == "mul" and float(scale_i.item()) <= 0.0:
+                    continue
+                if mode_i == "exp":
+                    cur_norm_i = ((cur_exp[bi] - min_v[bi]) / v_range[bi]).clamp(
+                        0.0, 1.0
+                    )
+                    target_i = min_v[bi] + (
+                        1.0 - (1.0 - cur_norm_i) ** scale_i
+                    ) * v_range[bi]
+                elif mode_i == "linear":
+                    if bool((scale_i >= 1.0).item()):
+                        target_i = cur_exp[bi] + (scale_i - 1.0) * (
+                            max_v[bi] - cur_exp[bi]
+                        )
+                    else:
+                        target_i = cur_exp[bi] - (1.0 - scale_i) * (
+                            cur_exp[bi] - min_v[bi]
+                        )
+                elif mode_i == "length_mul":
+                    gamma = 0.997
+                    log_gamma = math.log(gamma)
+                    mu_v = cur_exp[bi].clamp(min=1e-15, max=1.0 - 1e-15)
+                    l_cur = torch.log1p(-mu_v) / log_gamma
+                    target_i = 1.0 - torch.exp(scale_i * l_cur * log_gamma)
+                    target_i = target_i.clamp(min_v[bi] + 1e-12, max_v[bi] - 1e-12)
+                else:  # "mul"
+                    target_i = cur_exp[bi] * scale_i
+
+                eps_i = (v_range[bi] * 1e-6).clamp(min=1e-12)
+                target_i = torch.max(
+                    torch.min(target_i, max_v[bi] - eps_i), min_v[bi] + eps_i
+                )
+                if not bool(
+                    ((v_range[bi] > 1e-8) & (torch.abs(target_i - cur_exp[bi]) > 1e-8)).item()
+                ):
+                    continue
+
+                log_p_i = torch.log(p_norm[bi].clamp(min=1e-20))
+                log_p_i = log_p_i.masked_fill(~valid_i, -1e9)
+                dv_i = (values[bi] - min_v[bi]).masked_fill(~valid_i, 0.0)
+                lam_i = torch.zeros((), device=device, dtype=torch.float32)
+                for _ in range(20):
+                    logits = log_p_i + dv_i * lam_i
+                    m = logits.max()
+                    w = torch.exp(logits - m).masked_fill(~valid_i, 0.0)
+                    w = w / w.sum().clamp(min=1e-20)
+                    mean = (w * values[bi]).sum()
+                    mean2 = (w * values[bi] * values[bi]).sum()
+                    var = (mean2 - mean * mean).clamp(min=0.0)
+                    lam_i = (lam_i - (mean - target_i) / var.clamp(min=1e-16)).clamp(
+                        -100.0, 100.0
+                    )
+
+                final_logits = (log_p_i + dv_i * lam_i).masked_fill(~valid_i, -1e9)
+                m = final_logits.max()
+                w = torch.exp(final_logits - m).masked_fill(~valid_i, 0.0)
+                final_probs[bi] = w / w.sum().clamp(min=1e-20)
+        elif mode == "centered_exp":
             # print("centered_exp")
             # p'(i) ∝ p(i) * exp(sigmoid(emb(i)) * scale); values = sigmoid(emb) ∈ [0, 1].
             # Subtract per-row max before exp to prevent overflow (cancels in normalization).
@@ -1765,13 +2133,41 @@ class LvmGuidedSampler:
         Returns the modified probs tensor, or None when no guidance is needed
         (caller should use the original probs).
         """
+        timing_sample = {} if _lvm_timing_enabled() else None
+        t_apply = _lvm_timing_tic() if timing_sample is not None else 0.0
+
+        t = _lvm_timing_tic() if timing_sample is not None else 0.0
+        req_list = reqs if isinstance(reqs, list) else list(reqs)
+        if not any(self._req_wants_value_guidance(req) for req in req_list):
+            _lvm_timing_toc(timing_sample, "precheck", t)
+            _lvm_timing_toc(timing_sample, "apply_total", t_apply)
+            _record_lvm_timing(timing_sample, skipped=True)
+            return None
+        _lvm_timing_toc(timing_sample, "precheck", t)
+
+        t = _lvm_timing_tic() if timing_sample is not None else 0.0
         inproc = self._get_inproc_provider()
+        _lvm_timing_toc(timing_sample, "get_inproc_provider", t)
         if inproc not in (None, False):
             # Free KV cache for requests that have finished or aborted
-            inproc.clean_stale_requests(set(r.rid for r in reqs))
+            t = _lvm_timing_tic() if timing_sample is not None else 0.0
+            inproc.clean_stale_requests(set(r.rid for r in req_list))
+            _lvm_timing_toc(timing_sample, "clean_stale", t)
 
-        pending = self._build_pending(probs, reqs, temperatures, top_ps, top_ks, min_ps)
+        t = _lvm_timing_tic() if timing_sample is not None else 0.0
+        pending = self._build_pending(
+            probs,
+            req_list,
+            temperatures,
+            top_ps,
+            top_ks,
+            min_ps,
+            enable_gpu_candidate_compact=inproc not in (None, False),
+        )
+        _lvm_timing_toc(timing_sample, "build_pending", t)
         if pending is None:
+            _lvm_timing_toc(timing_sample, "apply_total", t_apply)
+            _record_lvm_timing(timing_sample, skipped=True)
             return None
 
         if pending.send_batch_indices:
@@ -1781,21 +2177,61 @@ class LvmGuidedSampler:
                 if inproc not in (None, False):
                     try:
                         rids_send = [req.rid for req in reqs_send]
-                        inproc.tree_value_extend(rids_send, pending.prefix_ids_send, reqs_send)
-                        gpu_emb = inproc.tree_value_launch_gpu(
-                            rids_send, pending.candidate_ids_send, gpu_candidates=pending.gpu_candidates
+                        t = _lvm_timing_tic() if timing_sample is not None else 0.0
+                        gpu_emb = inproc.tree_value_extend_and_launch_gpu(
+                            rids_send,
+                            pending.prefix_ids_send,
+                            reqs_send,
+                            pending.candidate_ids_send,
+                            gpu_candidates=pending.gpu_candidates,
+                            candidate_lens=pending.candidate_lens_send,
                         )
+                        _lvm_timing_toc(timing_sample, "extend_launch_fused", t)
+                        fused_path = gpu_emb is not None
+                        if gpu_emb is None:
+                            t = _lvm_timing_tic() if timing_sample is not None else 0.0
+                            inproc.tree_value_extend(
+                                rids_send, pending.prefix_ids_send, reqs_send
+                            )
+                            _lvm_timing_toc(timing_sample, "extend_prefix", t)
+                            t = _lvm_timing_tic() if timing_sample is not None else 0.0
+                            gpu_emb = inproc.tree_value_launch_gpu(
+                                rids_send,
+                                pending.candidate_ids_send,
+                                gpu_candidates=pending.gpu_candidates,
+                                candidate_lens=pending.candidate_lens_send,
+                            )
+                            _lvm_timing_toc(timing_sample, "launch_candidates", t)
+                        t = _lvm_timing_tic() if timing_sample is not None else 0.0
                         gpu_embeddings = inproc.tree_value_collect_gpu(gpu_emb)
+                        _lvm_timing_toc(timing_sample, "collect_gpu", t)
+                        t = _lvm_timing_tic() if timing_sample is not None else 0.0
                         self._apply_guidance_gpu(pending, gpu_embeddings)
+                        _lvm_timing_toc(timing_sample, "apply_guidance_gpu", t)
+                        _lvm_timing_toc(timing_sample, "apply_total", t_apply)
+                        _record_lvm_timing(
+                            timing_sample,
+                            pending=pending,
+                            gpu_path=True,
+                            fused_path=fused_path,
+                        )
                         return pending.guided
                     except Exception as exc:
                         raise RuntimeError("LenVM GPU guidance path failed") from exc
 
+            t = _lvm_timing_tic() if timing_sample is not None else 0.0
             lvm_values = self._post_tree_value(
                 [req.rid for req in reqs_send], pending.prefix_ids_send, pending.candidate_ids_send, reqs_send
             )
+            _lvm_timing_toc(timing_sample, "post_tree_value", t)
             if lvm_values is None:
+                _lvm_timing_toc(timing_sample, "apply_total", t_apply)
+                _record_lvm_timing(timing_sample, pending=pending)
                 return None
+            t = _lvm_timing_tic() if timing_sample is not None else 0.0
             self._apply_guidance(pending, lvm_values)
+            _lvm_timing_toc(timing_sample, "apply_guidance_cpu", t)
 
+        _lvm_timing_toc(timing_sample, "apply_total", t_apply)
+        _record_lvm_timing(timing_sample, pending=pending)
         return pending.guided
