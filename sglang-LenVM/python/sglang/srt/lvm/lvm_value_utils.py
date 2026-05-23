@@ -10,6 +10,10 @@ def get_eos_token_ids(req: Any) -> Set[int]:
     - `req.eos_token_ids`: a Set[int] from `ModelConfig.hf_eos_token_id` (preferred)
     - `req.tokenizer.eos_token_id`: tokenizer-defined EOS id
     """
+    cached = getattr(req, "_lvm_eos_token_ids", None)
+    if cached is not None:
+        return set(cached)
+
     eos: Set[int] = set()
 
     eos_ids = getattr(req, "eos_token_ids", None)
@@ -32,6 +36,10 @@ def get_eos_token_ids(req: Any) -> Set[int]:
         except Exception as exc:
             raise ValueError(f"Invalid LenVM tokenizer eos_token_id: {tok_eos!r}") from exc
 
+    try:
+        setattr(req, "_lvm_eos_token_ids", tuple(sorted(eos)))
+    except Exception:
+        pass
     return eos
 
 
@@ -52,4 +60,3 @@ def force_eos_value_zero(token_ids: List[int], token_values: List[float], req: A
                 token_values[j] = 0.0
         except Exception as exc:
             raise ValueError(f"Invalid LenVM token id while forcing EOS value to zero: {tid!r}") from exc
-

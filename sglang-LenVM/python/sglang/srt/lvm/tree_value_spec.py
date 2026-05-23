@@ -41,6 +41,45 @@ class TreeValueSpecInput(SpecInput):
         # No token multiplier for DP buffers.
         return 1, 1
 
+    def generate_attn_arg_prefill(
+        self,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        req_to_token: torch.Tensor,
+    ):
+        """Build attention arguments for flashinfer-style prefill backends."""
+        from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+
+        device = req_pool_indices.device
+        q_lens, k_lens, _mask_offsets, _pos_offsets = self._per_req_qk_and_offsets()
+        bs = len(q_lens)
+
+        q_lens_t = torch.tensor(q_lens, dtype=torch.int32, device=device)
+        k_lens_t = torch.tensor(k_lens, dtype=torch.int32, device=device)
+
+        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        qo_indptr[1:] = torch.cumsum(q_lens_t, dim=0)
+        kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1:] = torch.cumsum(k_lens_t, dim=0)
+
+        if paged_kernel_lens_sum is None:
+            paged_kernel_lens_sum = sum(k_lens)
+
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device=device
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            k_lens_t,
+            kv_indptr,
+            None,
+            kv_indices,
+            req_to_token.size(1),
+        )
+        return kv_indices, kv_indptr, qo_indptr, self.custom_mask
+
     def _per_req_qk_and_offsets(self) -> Tuple[List[int], List[int], List[int], List[int]]:
         """
         Compute per-request:
@@ -250,8 +289,8 @@ def build_tree_value_custom_mask_and_positions(
         # Candidate rows: attend all prefix tokens (0..L-1) and itself.
         cand_row_start = L - P
         m[cand_row_start : cand_row_start + N, :L] = True
-        for j in range(N):
-            m[cand_row_start + j, L + j] = True
+        cand_arange = np.arange(N)
+        m[cand_row_start + cand_arange, L + cand_arange] = True
 
         mask_off += q_len * k_len
 
@@ -265,4 +304,3 @@ def build_tree_value_custom_mask_and_positions(
     custom_mask = torch.from_numpy(mask_buf).to(device=device, non_blocking=True)
     positions   = torch.from_numpy(pos_buf).to(device=device, non_blocking=True)
     return custom_mask, positions
-

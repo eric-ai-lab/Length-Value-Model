@@ -83,22 +83,23 @@ class Qwen3ForLengthValueModel(Qwen3ForCausalLM):
         prefix_lens = getattr(spec, "tree_value_prefix_lens", None) if spec is not None else None
         cand_lens = getattr(spec, "tree_value_candidate_lens", None) if spec is not None else None
         if prefix_lens is not None and cand_lens is not None:
-            extend_lens = forward_batch.extend_seq_lens.tolist()
             cached_prefix_lens = (
-                forward_batch.extend_prefix_lens.tolist()
-                if forward_batch.extend_prefix_lens is not None
-                else [0] * len(extend_lens)
+                getattr(spec, "tree_value_cached_prefix_lens", None)
+                or [0] * len(prefix_lens)
             )
 
             out: list[torch.Tensor] = []
             offset = 0
-            for i, ext_len in enumerate(extend_lens):
+            for i, (prefix_len, cand_len, cached_prefix_len) in enumerate(
+                zip(prefix_lens, cand_lens, cached_prefix_lens)
+            ):
+                L = int(prefix_len)
+                N = int(cand_len)
+                P = int(cached_prefix_len)
+                ext_len = max(L - P, 0) + N
                 vals_i = token_values[offset : offset + ext_len]
                 offset += ext_len
 
-                L = int(prefix_lens[i])
-                N = int(cand_lens[i])
-                P = int(cached_prefix_lens[i])
                 cand_offset = max(L - P, 0)
                 out.append(vals_i[cand_offset : cand_offset + N])
             return EmbeddingPoolerOutput(embeddings=out)
