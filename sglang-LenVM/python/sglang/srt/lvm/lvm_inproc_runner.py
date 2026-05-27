@@ -13,6 +13,7 @@ Versus the old approach: O(B * L) tokens forwarded per step.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 import torch
@@ -21,6 +22,7 @@ from sglang.srt.lvm.tree_value_spec import (
     TreeValueSpecInput,
     build_tree_value_custom_mask_and_positions,
 )
+from sglang.srt.lvm.timing import get_timer
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -120,7 +122,6 @@ class LvmInprocRunner:
         # the LenVM may have different hidden sizes, so sharing the global cache can
         # return wrong-shape visual embeddings and silently corrupt the VLM path.
         from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
-        import os
 
         lvm_cache_bytes = int(os.environ.get("SGLANG_LVM_VLM_CACHE_SIZE_MB", 512)) * 1024 * 1024
         self._lvm_embedding_cache = MultiModalStaticCache(lvm_cache_bytes)
@@ -301,7 +302,7 @@ class LvmInprocRunner:
                         if isinstance(feature, torch.Tensor) and not feature.is_cuda:
                             mm_item.feature = feature.to(device)
 
-        with self._lvm_embedding_cache_ctx():
+        with torch.inference_mode(), self._lvm_embedding_cache_ctx():
             runner.forward_extend(forward_batch)
 
         # Update kv_lens (KV for new tokens is now in the pool).
@@ -337,6 +338,10 @@ class LvmInprocRunner:
         cand_lens = [len(cands) for cands in candidate_ids_per_req]
         seq_lens_list = [prefix_lens[i] + cand_lens[i] for i in range(len(rids))]
         total_cands = sum(cand_lens)
+        get_timer().set_meta(
+            lvm_candidate_tokens=total_cands,
+            lvm_candidate_max_len=max(cand_lens) if cand_lens else 0,
+        )
         pool_indices = [self.kv_mgr.pool_indices[rid] for rid in rids]
 
         # Allocate temporary KV slots for candidate tokens.
@@ -449,10 +454,249 @@ class LvmInprocRunner:
             forward_batch.mrope_positions = torch.cat(cand_mrope_chunks, dim=1)
 
         try:
-            logits_output = runner.forward_extend(forward_batch)
+            with torch.inference_mode():
+                logits_output = runner.forward_extend(forward_batch)
         finally:
             # Free candidate KV slots immediately (they must not be cached).
             runner.token_to_kv_pool_allocator.free(out_cache_loc)
+
+        return logits_output.embeddings
+
+    def eval_prefix_and_candidates_batch_gpu(
+        self,
+        rids: List[str],
+        prefix_ids_per_req: List[List[int]],
+        candidate_ids_per_req: List[List[int]],
+        gpu_candidates: Optional[tuple] = None,
+    ) -> List[torch.Tensor]:
+        """Evaluate uncached prefix suffixes and candidate tokens in one forward.
+
+        This is exact tree-value evaluation, not an approximation:
+          - uncached prefix suffix tokens are forwarded causally and kept in KV cache;
+          - candidate tokens attend to the full prefix and only themselves;
+          - candidate KV slots are freed after the forward.
+
+        It replaces the old hot path of `extend_prefix_batch` followed by
+        `eval_candidates_batch_gpu`, reducing one LenVM model launch per guided step.
+        """
+        if not rids:
+            return []
+
+        runner = self.runner
+        device = self.device
+
+        pool_indices = [self.kv_mgr.get_or_alloc(rid) for rid in rids]
+        cached_prefix_lens: List[int] = []
+        full_prefix_lens: List[int] = []
+        suffix_ids_per_req: List[List[int]] = []
+
+        for rid, prefix_ids in zip(rids, prefix_ids_per_req):
+            cached_len = self.kv_mgr.kv_len(rid)
+            target_len = len(prefix_ids)
+            if target_len < cached_len:
+                self.kv_mgr.retract(rid, target_len)
+                cached_len = target_len
+            cached_prefix_lens.append(cached_len)
+            full_prefix_lens.append(target_len)
+            suffix_ids_per_req.append(prefix_ids[cached_len:])
+
+        suffix_lens = [len(x) for x in suffix_ids_per_req]
+        cand_lens = [len(cands) for cands in candidate_ids_per_req]
+        extend_lens = [s + n for s, n in zip(suffix_lens, cand_lens)]
+        seq_lens_list = [
+            full_prefix_lens[i] + cand_lens[i] for i in range(len(rids))
+        ]
+        total_extend = sum(extend_lens)
+        total_suffix = sum(suffix_lens)
+        total_cands = sum(cand_lens)
+        get_timer().set_meta(
+            lvm_fused_suffix_tokens=total_suffix,
+            lvm_fused_candidate_tokens=total_cands,
+            lvm_fused_total_extend_tokens=total_extend,
+            lvm_fused_max_suffix_len=max(suffix_lens) if suffix_lens else 0,
+            lvm_fused_max_candidate_len=max(cand_lens) if cand_lens else 0,
+        )
+
+        if total_extend == 0:
+            return []
+
+        allocator = runner.token_to_kv_pool_allocator
+        if getattr(allocator, "page_size", 1) == 1:
+            out_cache_loc = allocator.alloc(total_extend)
+        else:
+            last_loc = torch.empty(len(pool_indices), dtype=torch.int64, device=device)
+            for i, (pool_idx, p_len) in enumerate(zip(pool_indices, cached_prefix_lens)):
+                last_loc[i] = (
+                    runner.req_to_token_pool.req_to_token[pool_idx, p_len - 1]
+                    if p_len > 0
+                    else -1
+                )
+            out_cache_loc = allocator.alloc_extend(
+                torch.tensor(cached_prefix_lens, dtype=torch.int64, device=device),
+                torch.tensor(cached_prefix_lens, dtype=torch.int64),
+                torch.tensor(seq_lens_list, dtype=torch.int64, device=device),
+                torch.tensor(seq_lens_list, dtype=torch.int64),
+                last_loc,
+                total_extend,
+            )
+        if out_cache_loc is None:
+            raise RuntimeError(
+                f"LVM KV pool OOM: cannot allocate {total_extend} slots for "
+                "fused prefix/candidate evaluation. Consider "
+                "--lvm-guided-inproc-mem-fraction-static."
+            )
+        out_cache_loc = out_cache_loc.to(torch.int64)
+
+        input_ids_flat: List[int] = []
+        suffix_input_positions: List[int] = []
+        suffix_input_ids: List[int] = []
+        candidate_input_positions: List[int] = []
+        candidate_cache_locs: List[torch.Tensor] = []
+        pt = 0
+        for pool_idx, p_len, s_len, n_cand, suffix, cands in zip(
+            pool_indices,
+            cached_prefix_lens,
+            suffix_lens,
+            cand_lens,
+            suffix_ids_per_req,
+            candidate_ids_per_req,
+        ):
+            if s_len:
+                runner.req_to_token_pool.write(
+                    (pool_idx, slice(p_len, p_len + s_len)),
+                    out_cache_loc[pt : pt + s_len],
+                )
+                input_ids_flat.extend(suffix)
+                suffix_input_positions.extend(range(pt, pt + s_len))
+                suffix_input_ids.extend(suffix)
+            if n_cand:
+                cand_start = pt + s_len
+                cand_end = cand_start + n_cand
+                cand_locs = out_cache_loc[cand_start:cand_end]
+                runner.req_to_token_pool.write(
+                    (pool_idx, slice(p_len + s_len, p_len + s_len + n_cand)),
+                    cand_locs,
+                )
+                candidate_cache_locs.append(cand_locs)
+                candidate_input_positions.extend(range(cand_start, cand_end))
+                if gpu_candidates is None:
+                    input_ids_flat.extend(cands)
+            pt += s_len + n_cand
+
+        if gpu_candidates is not None:
+            _, gpu_ids, gpu_mask = gpu_candidates
+            gpu_candidate_ids = gpu_ids[gpu_mask].to(torch.int64)
+            if int(gpu_candidate_ids.numel()) != total_cands:
+                raise RuntimeError(
+                    f"LenVM GPU candidate id count mismatch: "
+                    f"{gpu_candidate_ids.numel()} ids for {total_cands} candidates"
+                )
+            if total_suffix == 0:
+                input_ids_t = gpu_candidate_ids
+            else:
+                # Suffix ids are host-side request history, but candidate ids are
+                # already on GPU from top-k filtering. Assemble the flattened
+                # [suffix, candidates] input without copying candidate ids through
+                # Python lists.
+                input_ids_t = torch.empty(
+                    (total_extend,),
+                    dtype=torch.int64,
+                    device=device,
+                )
+                if suffix_input_ids:
+                    suffix_pos_t = torch.tensor(
+                        suffix_input_positions,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    suffix_ids_t = torch.tensor(
+                        suffix_input_ids,
+                        dtype=torch.int64,
+                        device=device,
+                    )
+                    input_ids_t.index_copy_(0, suffix_pos_t, suffix_ids_t)
+                if total_cands:
+                    cand_pos_t = torch.tensor(
+                        candidate_input_positions,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    input_ids_t.index_copy_(0, cand_pos_t, gpu_candidate_ids)
+        else:
+            input_ids_t = torch.tensor(
+                input_ids_flat,
+                dtype=torch.int64,
+                device=device,
+            )
+
+        req_pool_indices_t = torch.tensor(pool_indices, dtype=torch.int64, device=device)
+        seq_lens_t = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
+        seq_lens_cpu_t = torch.tensor(seq_lens_list, dtype=torch.int32)
+        extend_prefix_lens_t = torch.tensor(
+            cached_prefix_lens, dtype=torch.int32, device=device
+        )
+        extend_seq_lens_t = torch.tensor(extend_lens, dtype=torch.int32, device=device)
+
+        custom_mask, positions = build_tree_value_custom_mask_and_positions(
+            prefix_lens=full_prefix_lens,
+            candidate_lens=cand_lens,
+            cached_prefix_lens=cached_prefix_lens,
+            device=device,
+        )
+        spec_info = TreeValueSpecInput(
+            custom_mask=custom_mask,
+            positions=positions,
+            tree_value_prefix_lens=list(full_prefix_lens),
+            tree_value_candidate_lens=list(cand_lens),
+            tree_value_cached_prefix_lens=list(cached_prefix_lens),
+        )
+
+        extend_start_loc = torch.zeros(len(rids), dtype=torch.int32, device=device)
+        if len(rids) > 1:
+            extend_start_loc[1:] = torch.cumsum(extend_seq_lens_t[:-1], dim=0)
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=len(rids),
+            input_ids=input_ids_t,
+            req_pool_indices=req_pool_indices_t,
+            seq_lens=seq_lens_t,
+            seq_lens_cpu=seq_lens_cpu_t,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=sum(seq_lens_list),
+            positions=positions,
+            extend_num_tokens=total_extend,
+            extend_seq_lens=extend_seq_lens_t,
+            extend_prefix_lens=extend_prefix_lens_t,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=list(cached_prefix_lens),
+            extend_seq_lens_cpu=list(extend_lens),
+            req_to_token_pool=runner.req_to_token_pool,
+            token_to_kv_pool=runner.token_to_kv_pool,
+            attn_backend=runner.attn_backend,
+            return_logprob=False,
+            is_extend_in_batch=True,
+            is_prefill_only=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            spec_info=spec_info,
+            global_forward_mode=ForwardMode.EXTEND,
+        )
+        forward_batch.num_token_non_padded_cpu = total_extend
+
+        candidate_cache_loc_t = (
+            torch.cat(candidate_cache_locs)
+            if candidate_cache_locs
+            else torch.empty((0,), dtype=torch.int64, device=device)
+        )
+        try:
+            with torch.inference_mode():
+                logits_output = runner.forward_extend(forward_batch)
+        finally:
+            if candidate_cache_loc_t.numel() > 0:
+                runner.token_to_kv_pool_allocator.free(candidate_cache_loc_t)
+
+        for rid, s_len in zip(rids, suffix_lens):
+            self.kv_mgr.kv_lens[rid] += s_len
 
         return logits_output.embeddings
 

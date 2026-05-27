@@ -41,6 +41,46 @@ class TreeValueSpecInput(SpecInput):
         # No token multiplier for DP buffers.
         return 1, 1
 
+    def generate_attn_arg_prefill(
+        self,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: int,
+        req_to_token: torch.Tensor,
+    ):
+        """Build FlashInfer prefill metadata for LenVM tree-value masks."""
+        from sglang.srt.layers.attention.utils import (
+            create_flashinfer_kv_indices_triton,
+        )
+
+        device = req_pool_indices.device
+        bs = len(req_pool_indices)
+        q_lens, _k_lens, _mask_offsets, _pos_offsets = self._per_req_qk_and_offsets()
+
+        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        qo_indptr[1:] = torch.cumsum(
+            torch.tensor(q_lens[:bs], dtype=torch.int32, device=device), dim=0
+        )
+
+        kv_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        kv_indptr[1:] = torch.cumsum(paged_kernel_lens[:bs], dim=0)
+
+        kv_indices = torch.empty(
+            int(paged_kernel_lens_sum) + 256,
+            dtype=torch.int32,
+            device=device,
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            req_to_token.size(1),
+        )
+        return kv_indices, kv_indptr, qo_indptr, self.custom_mask
+
     def _per_req_qk_and_offsets(self) -> Tuple[List[int], List[int], List[int], List[int]]:
         """
         Compute per-request:
@@ -265,4 +305,3 @@ def build_tree_value_custom_mask_and_positions(
     custom_mask = torch.from_numpy(mask_buf).to(device=device, non_blocking=True)
     positions   = torch.from_numpy(pos_buf).to(device=device, non_blocking=True)
     return custom_mask, positions
-

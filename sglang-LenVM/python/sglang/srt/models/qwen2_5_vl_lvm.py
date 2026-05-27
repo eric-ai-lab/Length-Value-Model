@@ -67,7 +67,6 @@ class Qwen2_5_VLForLengthValueModel(Qwen2_5_VLForConditionalGeneration):
             return hidden_states
 
         token_values = self.v_head(hidden_states).squeeze(-1)
-
         spec = getattr(forward_batch, "spec_info", None)
         prefix_lens = (
             getattr(spec, "tree_value_prefix_lens", None) if spec is not None else None
@@ -87,14 +86,14 @@ class Qwen2_5_VLForLengthValueModel(Qwen2_5_VLForConditionalGeneration):
             out: list[torch.Tensor] = []
             offset = 0
             for i, ext_len in enumerate(extend_lens):
-                vals_i = token_values[offset : offset + ext_len]
-                offset += ext_len
-
                 prefix_len = int(prefix_lens[i])
                 cand_len = int(cand_lens[i])
                 cached_prefix_len = int(cached_prefix_lens[i])
                 cand_offset = max(prefix_len - cached_prefix_len, 0)
-                out.append(vals_i[cand_offset : cand_offset + cand_len])
+                out.append(
+                    token_values[offset + cand_offset : offset + cand_offset + cand_len]
+                )
+                offset += ext_len
             return EmbeddingPoolerOutput(embeddings=out)
 
         if forward_batch.extend_seq_lens is None:
