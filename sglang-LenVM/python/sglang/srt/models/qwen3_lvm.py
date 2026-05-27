@@ -93,14 +93,12 @@ class Qwen3ForLengthValueModel(Qwen3ForCausalLM):
             out: list[torch.Tensor] = []
             offset = 0
             for i, ext_len in enumerate(extend_lens):
-                vals_i = token_values[offset : offset + ext_len]
-                offset += ext_len
-
                 L = int(prefix_lens[i])
                 N = int(cand_lens[i])
                 P = int(cached_prefix_lens[i])
                 cand_offset = max(L - P, 0)
-                out.append(vals_i[cand_offset : cand_offset + N])
+                out.append(token_values[offset + cand_offset : offset + cand_offset + N])
+                offset += ext_len
             return EmbeddingPoolerOutput(embeddings=out)
 
         # Otherwise (e.g., /encode), return tokenwise values for the forwarded tokens.
